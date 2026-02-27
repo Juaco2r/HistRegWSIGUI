@@ -5,6 +5,8 @@ HistRegGUI is a standalone Windows application that runs **DeeperHistReg** to re
 
 This distribution is configured to run **CPU-only** (CUDA disabled) for portability and to avoid GPU/CUDA runtime issues.
 
+![Hist Reg App Concept](assets/screenshots/DeeperHistReg_concept.png)
+
 ---
 
 ## 📥 Download (v1.0)
@@ -37,6 +39,7 @@ Output file naming:
 ```
 <moving>_warped_to_<fixed>.tif
 ```
+![Hist Reg App Screenshot](assets/screenshots/DeeperHistReg.png)
 
 ---
 
