@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-"""Pure helpers for one-target/many-moving-image registration batches."""
+"""Pure helpers for independent and cascading registration batches."""
 
 import csv
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+
+REGISTRATION_MODE_SAME_TARGET = "same_target"
+REGISTRATION_MODE_CASCADE = "cascade"
+REGISTRATION_MODES = {
+    "Independent: every moving image → fixed target": REGISTRATION_MODE_SAME_TARGET,
+    "Cascading: each slice → previous warped slice": REGISTRATION_MODE_CASCADE,
+}
 
 
 @dataclass(frozen=True)
@@ -17,11 +25,14 @@ class RegistrationPlanItem:
     moving_path: Path
     warped_output: Path
     run_directory: Path
+    working_source: Path | None = None
 
 
 @dataclass(frozen=True)
 class RegistrationBatchPlan:
     fixed_path: Path
+    registration_mode: str
+    registration_downsample: int
     batch_root: Path | None
     manifest_csv: Path
     manifest_json: Path
@@ -33,10 +44,64 @@ class RegistrationBatchPlan:
         return len(self.items) > 1
 
     @property
+    def is_cascade(self) -> bool:
+        return self.registration_mode == REGISTRATION_MODE_CASCADE
+
+    @property
     def output_directory(self) -> Path:
         if self.batch_root is not None:
             return self.batch_root / "warped"
         return self.fixed_path.parent
+
+    @property
+    def reference_directory(self) -> Path:
+        if self.batch_root is not None:
+            return self.batch_root / "reference"
+        return self.fixed_path.parent
+
+    @property
+    def working_directory(self) -> Path:
+        if self.batch_root is not None:
+            return self.batch_root / "working"
+        return self.fixed_path.parent / f"HistRegGUI_work_{self.manifest_csv.stem}"
+
+    @property
+    def intermediate_directory(self) -> Path:
+        if self.batch_root is not None:
+            return self.batch_root / "intermediate"
+        return self.items[0].run_directory.parent if self.items else self.fixed_path.parent
+
+
+def normalize_registration_mode(value: str) -> str:
+    mode = REGISTRATION_MODES.get(str(value), str(value)).strip().lower()
+    if mode not in {REGISTRATION_MODE_SAME_TARGET, REGISTRATION_MODE_CASCADE}:
+        raise ValueError(f"Unsupported registration mode: {value}")
+    return mode
+
+
+def registration_target_for_step(
+    registration_mode: str,
+    fixed_registration_path: str | Path,
+    previous_warped_output: str | Path | None,
+) -> Path:
+    """Return the target for one ordered step.
+
+    Independent mode always uses the original fixed target. Cascading mode uses
+    the previously warped output after the first step. A missing previous output
+    is an error because continuing would break the consecutive-slice chain.
+    """
+
+    mode = normalize_registration_mode(registration_mode)
+    fixed = Path(fixed_registration_path)
+    if mode == REGISTRATION_MODE_SAME_TARGET or previous_warped_output is None:
+        return fixed
+    previous = Path(previous_warped_output)
+    if not previous.exists():
+        raise FileNotFoundError(
+            "The previous warped slice required by the cascade does not exist: "
+            f"{previous}"
+        )
+    return previous
 
 
 def _path_identity(path: Path) -> str:
@@ -73,17 +138,25 @@ def safe_stem(value: str, fallback: str = "image") -> str:
     return text or fallback
 
 
+def _downsample_suffix(registration_downsample: int) -> str:
+    factor = int(registration_downsample)
+    return "" if factor == 1 else f"_regds{factor}"
+
+
 def build_registration_batch_plan(
     fixed_path: str | Path,
     moving_paths: Sequence[str | Path],
     run_stamp: str,
+    *,
+    registration_mode: str = REGISTRATION_MODE_SAME_TARGET,
+    registration_downsample: int = 1,
 ) -> RegistrationBatchPlan:
-    """Plan output paths for either a single registration or a safe batch.
+    """Plan outputs for independent or consecutive cascading registration.
 
-    Single-image output intentionally preserves the original v1.0 behavior:
-    the warped TIFF is written next to the fixed image. Multiple moving images
-    are grouped under one timestamped batch directory with numbered filenames,
-    preventing collisions when different folders contain equal basenames.
+    The original single-image behavior is retained only for independent,
+    full-resolution registration. Cascading runs and pre-downsampled runs always
+    receive a dedicated run folder because they create a reference image,
+    ordered intermediate dependencies, or both.
     """
 
     fixed = Path(fixed_path).expanduser()
@@ -91,11 +164,18 @@ def build_registration_batch_plan(
     if not moving:
         raise ValueError("At least one moving image is required.")
 
+    mode = normalize_registration_mode(registration_mode)
+    factor = int(registration_downsample)
+    if factor < 1:
+        raise ValueError("Registration downsample must be at least 1.")
+
     fixed_stem = safe_stem(fixed.stem, "fixed")
     stamp = safe_stem(run_stamp, "run")
+    suffix = _downsample_suffix(factor)
     items: list[RegistrationPlanItem] = []
 
-    if len(moving) == 1:
+    legacy_single = len(moving) == 1 and mode == REGISTRATION_MODE_SAME_TARGET and factor == 1
+    if legacy_single:
         source = moving[0]
         source_stem = safe_stem(source.stem, "moving")
         items.append(
@@ -104,10 +184,13 @@ def build_registration_batch_plan(
                 moving_path=source,
                 warped_output=fixed.parent / f"{source_stem}_warped_to_{fixed_stem}.tif",
                 run_directory=fixed.parent / f"Run_{stamp}",
+                working_source=None,
             )
         )
         return RegistrationBatchPlan(
             fixed_path=fixed,
+            registration_mode=mode,
+            registration_downsample=factor,
             batch_root=None,
             manifest_csv=fixed.parent / f"HistRegGUI_registration_{stamp}.csv",
             manifest_json=fixed.parent / f"HistRegGUI_registration_{stamp}.json",
@@ -115,24 +198,44 @@ def build_registration_batch_plan(
             items=tuple(items),
         )
 
-    batch_root = fixed.parent / f"HistRegGUI_batch_{fixed_stem}_{stamp}"
+    if mode == REGISTRATION_MODE_CASCADE:
+        folder_prefix = "HistRegGUI_cascade"
+    elif factor > 1:
+        folder_prefix = "HistRegGUI_downsampled_batch"
+    else:
+        folder_prefix = "HistRegGUI_batch"
+
+    batch_root = fixed.parent / f"{folder_prefix}_{fixed_stem}_{stamp}"
     warped_root = batch_root / "warped"
     intermediate_root = batch_root / "intermediate"
+    working_root = batch_root / "working"
 
+    previous_label = f"000_{fixed_stem}"
     for index, source in enumerate(moving, start=1):
         source_stem = safe_stem(source.stem, "moving")
         prefix = f"{index:03d}_{source_stem}"
+        if mode == REGISTRATION_MODE_CASCADE:
+            output_name = f"{prefix}_cascaded_to_{previous_label}{suffix}.tif"
+            previous_label = f"{index:03d}_{source_stem}"
+        else:
+            output_name = f"{prefix}_warped_to_{fixed_stem}{suffix}.tif"
+        working_source = (
+            working_root / f"{prefix}_working{suffix}.ome.tif" if factor > 1 else None
+        )
         items.append(
             RegistrationPlanItem(
                 index=index,
                 moving_path=source,
-                warped_output=warped_root / f"{prefix}_warped_to_{fixed_stem}.tif",
+                warped_output=warped_root / output_name,
                 run_directory=intermediate_root / f"{prefix}_Run",
+                working_source=working_source,
             )
         )
 
     return RegistrationBatchPlan(
         fixed_path=fixed,
+        registration_mode=mode,
+        registration_downsample=factor,
         batch_root=batch_root,
         manifest_csv=batch_root / "registration_manifest.csv",
         manifest_json=batch_root / "registration_manifest.json",
@@ -141,12 +244,21 @@ def build_registration_batch_plan(
     )
 
 
+def default_reference_image_path(plan: RegistrationBatchPlan) -> Path:
+    """Return the retained downsampled fixed/reference image path."""
+
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    factor = int(plan.registration_downsample)
+    return plan.reference_directory / f"000_fixed_{fixed_stem}_regds{factor}.ome.tif"
+
+
 def default_merged_volume_path(plan: RegistrationBatchPlan) -> Path:
     """Return a collision-safe OME-TIFF path for an optional merged stack."""
 
     fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
     if plan.batch_root is not None:
-        return plan.batch_root / "merged" / f"HistRegGUI_registered_stack_{fixed_stem}.ome.tif"
+        prefix = "HistRegGUI_cascade_stack" if plan.is_cascade else "HistRegGUI_registered_stack"
+        return plan.batch_root / "merged" / f"{prefix}_{fixed_stem}.ome.tif"
 
     manifest_stem = plan.manifest_csv.stem
     stamp = manifest_stem.removeprefix("HistRegGUI_registration_")
@@ -165,8 +277,12 @@ def write_registration_manifest(
     fieldnames = [
         "index",
         "status",
+        "registration_mode",
+        "registration_downsample",
         "fixed_image",
         "moving_image",
+        "registration_source",
+        "registration_target",
         "warped_output",
         "intermediate_directory",
         "loader",
@@ -185,6 +301,8 @@ def write_registration_manifest(
 
     payload = {
         "fixed_image": str(plan.fixed_path),
+        "registration_mode": plan.registration_mode,
+        "registration_downsample": plan.registration_downsample,
         "batch_root": str(plan.batch_root) if plan.batch_root else None,
         "items": rows,
         "run_summary": dict(run_summary or {}),

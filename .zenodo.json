@@ -8,7 +8,7 @@
   ],
   "title": "HistRegGUI: Multiplatform Histological Image Registration with DeeperHistReg",
   "version": "1.0",
-  "description": "HistRegGUI is a desktop interface for histological image registration with DeeperHistReg. It supports registering one or multiple moving images to the same fixed target, CPU and optional NVIDIA CUDA execution, automatic and manual image-reader selection, batch manifests, and optional memory-efficient tiled BigTIFF OME-TIFF stack creation for 3-D visualization in software such as Imaris. Packaged applications are provided for Windows, Linux, macOS Intel, and macOS Apple Silicon.",
+  "description": "HistRegGUI is a desktop interface for histological image registration with DeeperHistReg. It supports independent one-target batch registration and ordered cascading registration of consecutive sections, where each slice is registered to the previous warped slice. It provides streamed 1x-32x registration downsampling, CPU and optional NVIDIA CUDA execution, automatic and manual image-reader selection, batch/cascade manifests, and optional memory-efficient tiled BigTIFF OME-TIFF stack creation for 3-D visualization in software such as Imaris. Packaged applications are provided for Windows, Linux, macOS Intel, and macOS Apple Silicon.",
   "access_right": "open",
   "keywords": [
     "digital pathology",
@@ -21,7 +21,11 @@
     "OME-TIFF",
     "3D reconstruction",
     "Imaris",
-    "volumetric imaging"
+    "volumetric imaging",
+    "cascading registration",
+    "serial sections",
+    "consecutive slices",
+    "streaming image processing"
   ],
   "license": "mit",
   "upload_type": "software",

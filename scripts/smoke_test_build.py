@@ -85,6 +85,10 @@ def main() -> None:
         raise RuntimeError(f"Pillow Tk compatibility alias was not packaged: {payload}")
     if payload.get("batch_registration") != "ok":
         raise RuntimeError(f"Batch registration support was not packaged: {payload}")
+    if payload.get("cascading_registration") != "ok":
+        raise RuntimeError(f"Cascading registration support was not packaged: {payload}")
+    if payload.get("streamed_registration_downsample") != "ok":
+        raise RuntimeError(f"Registration downsample support was not packaged: {payload}")
     if payload.get("version") != "1.0":
         raise RuntimeError(f"Unexpected packaged application version: {payload}")
     if int(payload.get("supported_extension_count", 0)) < 10:

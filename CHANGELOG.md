@@ -5,6 +5,10 @@
 ### Added
 - First public HistRegGUI release for Windows, Linux, macOS Intel, and macOS Apple Silicon.
 - One-fixed-target batch registration for selecting and processing multiple moving images.
+- Ordered cascading registration for consecutive sections: each slice is registered to the previous successfully warped slice.
+- Streamed 1×–32× registration downsampling with retained fixed-reference OME-TIFF and temporary per-slice working images.
+- No application-level slice-count limit; sequential processing keeps memory independent of the number of slices.
+- Cascade dependency handling that stops after a failed step and records later slices as `skipped_dependency`.
 - Per-image queue, reader, running, completion, and failure status in the moving-image table.
 - Sequential batch execution with GPU-memory cleanup between images and continuation after individual failures.
 - Collision-safe numbered batch outputs plus CSV and JSON registration manifests.

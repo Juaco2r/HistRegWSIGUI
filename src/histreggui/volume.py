@@ -57,6 +57,31 @@ class MergedVolumeResult:
 
 
 @dataclass(frozen=True)
+class WorkingImageResult:
+    source_path: Path
+    path: Path
+    original_width: int
+    original_height: int
+    width: int
+    height: int
+    downsample: int
+    scale_x: float
+    scale_y: float
+    pixel_size_x_um: float | None
+    pixel_size_y_um: float | None
+    reader: str
+    tile_size: int
+    compression: str
+    size_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["source_path"] = str(self.source_path)
+        data["path"] = str(self.path)
+        return data
+
+
+@dataclass(frozen=True)
 class _ReaderInfo:
     width: int
     height: int
@@ -501,6 +526,153 @@ def _stack_sidecar_path(output_path: Path) -> Path:
         if name.lower().endswith(suffix):
             return output_path.with_name(name[: -len(suffix)] + "_stack.json")
     return output_path.with_suffix(output_path.suffix + ".json")
+
+
+def create_downsampled_registration_tiff(
+    source_path: str | Path,
+    output_path: str | Path,
+    *,
+    downsample: int,
+    source_pixel_size_um: tuple[float, float] | None = None,
+    tile_size: int = 256,
+    compression: str = "deflate",
+    progress_callback: ProgressCallback | None = None,
+) -> WorkingImageResult:
+    """Create a tiled OME-BigTIFF registration copy without full-image RAM use.
+
+    The output is RGB uint8 because DeeperHistReg's histology pipeline expects a
+    visual image. The reader selects an existing pyramid level when possible and
+    streams one small output tile at a time. Physical X/Y calibration is scaled
+    using the *actual* output dimensions, avoiding rounding drift for odd image
+    sizes.
+    """
+
+    import tifffile
+
+    source_path = Path(source_path)
+    output_path = Path(output_path)
+    downsample = int(downsample)
+    tile_size = int(tile_size)
+    if downsample < 1:
+        raise ValueError("Registration downsample must be at least 1.")
+    if tile_size < 16 or tile_size % 16 != 0:
+        raise ValueError("TIFF tile size must be a multiple of 16.")
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Registration source does not exist: {source_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = output_path.with_name(output_path.name + ".partial")
+    partial_path.unlink(missing_ok=True)
+
+    with open_slice_reader(source_path, downsample) as probe_reader:
+        info = probe_reader.info
+    width = int(info.output_width)
+    height = int(info.output_height)
+    scale_x = float(info.width) / float(width)
+    scale_y = float(info.height) / float(height)
+
+    if source_pixel_size_um is None:
+        source_pixel_size_um = infer_pixel_size_um(source_path)
+    pixel_size_x_um = None
+    pixel_size_y_um = None
+    if source_pixel_size_um is not None:
+        pixel_size_x_um = float(source_pixel_size_um[0]) * scale_x
+        pixel_size_y_um = float(source_pixel_size_um[1]) * scale_y
+
+    tiles_x = int(math.ceil(width / tile_size))
+    tiles_y = int(math.ceil(height / tile_size))
+    total_tiles = tiles_x * tiles_y
+    completed_tiles = 0
+
+    def tile_iterator() -> Iterable[np.ndarray]:
+        nonlocal completed_tiles
+        with open_slice_reader(source_path, downsample) as reader:
+            for y in range(0, height, tile_size):
+                tile_height = min(tile_size, height - y)
+                for x in range(0, width, tile_size):
+                    tile_width = min(tile_size, width - x)
+                    tile = reader.read_tile(x, y, tile_width, tile_height)
+                    completed_tiles += 1
+                    if progress_callback and (
+                        completed_tiles == total_tiles
+                        or completed_tiles % max(1, total_tiles // 100) == 0
+                    ):
+                        progress_callback(
+                            completed_tiles,
+                            total_tiles,
+                            f"Preparing downsampled registration image: "
+                            f"{completed_tiles}/{total_tiles} tiles",
+                        )
+                    yield np.ascontiguousarray(tile, dtype=np.uint8)
+
+    metadata: dict[str, object] = {
+        "axes": "YXS",
+        "Name": output_path.stem,
+    }
+    if pixel_size_x_um is not None and pixel_size_y_um is not None:
+        metadata.update(
+            {
+                "PhysicalSizeX": pixel_size_x_um,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": pixel_size_y_um,
+                "PhysicalSizeYUnit": "µm",
+            }
+        )
+
+    if progress_callback:
+        progress_callback(0, total_tiles, f"Preparing registration image: {source_path.name}")
+
+    try:
+        with tifffile.TiffWriter(str(partial_path), bigtiff=True, ome=True) as writer:
+            writer.write(
+                data=tile_iterator(),
+                shape=(height, width, 3),
+                dtype=np.uint8,
+                photometric="rgb",
+                planarconfig="contig",
+                tile=(tile_size, tile_size),
+                compression=compression,
+                metadata=metadata,
+                software="HistRegGUI v1.0",
+            )
+
+        with tifffile.TiffFile(str(partial_path)) as tif:
+            series = tif.series[0]
+            if not tif.is_bigtiff:
+                raise RuntimeError("Registration working image was not written as BigTIFF.")
+            if tif.ome_metadata is None:
+                raise RuntimeError("Registration working image is missing OME metadata.")
+            if tuple(series.shape) != (height, width, 3):
+                raise RuntimeError(
+                    f"Registration working image shape mismatch: {series.shape}; "
+                    f"expected {(height, width, 3)}"
+                )
+
+        os.replace(partial_path, output_path)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
+
+    result = WorkingImageResult(
+        source_path=source_path,
+        path=output_path,
+        original_width=int(info.width),
+        original_height=int(info.height),
+        width=width,
+        height=height,
+        downsample=downsample,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        pixel_size_x_um=pixel_size_x_um,
+        pixel_size_y_um=pixel_size_y_um,
+        reader=info.backend,
+        tile_size=tile_size,
+        compression=compression,
+        size_bytes=output_path.stat().st_size,
+    )
+    if progress_callback:
+        progress_callback(total_tiles, total_tiles, f"Registration image ready: {output_path.name}")
+    return result
 
 
 def create_merged_ome_tiff(

@@ -8,7 +8,12 @@ Last updated: 2026-07-15
 
 ## 1. Purpose
 
-HistRegGUI registers one or more moving histology images into the coordinate system of one fixed target image using DeeperHistReg. It provides a desktop interface for Windows, macOS, and Linux.
+HistRegGUI registers histological images with DeeperHistReg using either:
+
+- **Independent registration**: one or more moving images are each registered directly to one fixed target.
+- **Cascading consecutive-slice registration**: Slice 2 is warped to Slice 1, Slice 3 is warped to the already warped Slice 2, and the dependency chain continues through the ordered series.
+
+The application also provides optional streamed registration downsampling and memory-efficient 3-D OME-TIFF stack creation on Windows, macOS, and Linux.
 
 ## 2. Release editions
 
@@ -19,30 +24,50 @@ HistRegGUI registers one or more moving histology images into the coordinate sys
 ## 3. Input procedure
 
 1. Open HistRegGUI.
-2. Select the single **Target (Fixed)** image.
-3. Click **Add images...** and select one or several moving images.
-4. Review the moving-image table. Selecting a row displays that image in the moving preview.
-5. Keep **Input reader** on automatic or choose a reader manually.
-6. Choose a registration preset.
-7. Use **Move up** and **Move down** to define the intended Z-slice order.
-8. Optionally enable **Save intermediate results**.
-9. Optionally enable **Create merged OME-TIFF stack after registration** and set fixed-target inclusion, downsample, XY pixel size, and Z spacing.
-10. Optionally open **Hardware → Check CUDA availability...**.
-11. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
-12. Click **Run registration** or **Run registration batch**.
+2. Select the **Target (Fixed)** image. In cascading mode this is Slice 1.
+3. Click **Add images...** and select the following moving/consecutive slices.
+4. Use **Move up** and **Move down** to establish the exact order.
+5. Choose **Independent** or **Cascading** registration.
+6. Choose **Registration downsample**: 1×, 2×, 4×, 8×, 16×, or 32×.
+7. Keep **Input reader** on automatic or choose a reader manually. Registration downsample values above 1 create TIFF working images and therefore use the TIFF reader.
+8. Choose a registration preset.
+9. Optionally enable **Save intermediate and temporary working images**.
+10. Optionally enable **Create merged OME-TIFF stack after registration** and set first-slice inclusion, additional merge downsample, original XY pixel size, and Z spacing.
+11. Optionally open **Hardware → Check CUDA availability...**.
+12. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
+13. Start the registration.
 
-Accepted picker formats include TIFF/OME-TIFF, SVS, NDPI, MRXS, SCN, VMS, VMU, BIF, SVSLIDE, DICOM, JPG/JPEG, PNG, BMP, WebP, and JPEG 2000. Previews use tifffile, OpenSlide, libvips, Pillow, and SimpleITK fallbacks and are downsampled only for display.
+Accepted picker formats include TIFF/OME-TIFF, SVS, NDPI, MRXS, SCN, VMS, VMU, BIF, SVSLIDE, DICOM, JPG/JPEG, PNG, BMP, WebP, and JPEG 2000. Previews use tifffile, OpenSlide, libvips, Pillow, and SimpleITK fallbacks and are reduced only for display.
 
-With automatic reader selection, the reader is resolved independently for every moving/fixed pair. A batch can therefore use different readers for different source formats.
+## 4. Registration behavior
 
-## 4. Batch behavior
+### 4.1 Independent mode
 
-- All moving images are registered to the same fixed target.
-- Duplicate selections are ignored.
-- Images are processed sequentially to limit CPU, RAM, and GPU-memory growth.
-- CUDA cache and Python objects are released between registrations.
-- One failed moving image is logged and does not prevent the remaining images from running.
-- The table reports queued, running, completed, or failed status for each image.
+- Every moving image is registered to the same fixed target.
+- One failed image is logged and the remaining images continue.
+- Automatic reader selection is resolved for every moving/fixed pair.
+
+### 4.2 Cascading mode
+
+- The fixed image is Slice 1.
+- The first moving image is registered and warped to Slice 1.
+- Each later image is registered to the immediately previous **warped** output, not to the original previous input.
+- The ordered chain is therefore `2 → 1`, `3 → warped 2`, `4 → warped 3`, and so forth.
+- A failed step stops the chain. Later slices are marked `skipped_dependency`, because their required previous warped target does not exist.
+- The manifest records the actual source and target used for every step.
+- Local errors and interpolation effects can accumulate along a long cascade, so every result must be reviewed visually.
+
+There is no application-level slice-count limit. Images are processed sequentially and the list of paths is the only memory that grows with the number of slices.
+
+### 4.3 Registration downsampling
+
+For factors above 1, HistRegGUI creates tiled OME-BigTIFF working images by streaming one small region at a time. It does not load the complete slide into RAM.
+
+- The downsampled first/fixed reference is retained because it defines the output geometry.
+- Each moving working image is created immediately before its registration step.
+- Temporary moving working images are removed after use unless intermediate retention is enabled.
+- Warped outputs are produced at the selected reduced resolution; this is not a full-resolution warp.
+- Physical X/Y calibration is scaled using the actual output dimensions, including odd-size rounding.
 
 ## 5. Hardware selection
 
@@ -58,58 +83,47 @@ When CUDA is unavailable, the checkbox remains disabled. Before each registratio
 
 ## 6. Output
 
-For one moving image, the final warped image is written next to the fixed image:
+The original one-moving-image, full-resolution independent output is written next to the fixed image:
 
 ```text
 <moving>_warped_to_<fixed>.tif
 ```
 
-For several moving images, a timestamped directory is created next to the fixed image:
+Independent batches create `HistRegGUI_batch_<fixed>_<timestamp>/`. Cascading runs create `HistRegGUI_cascade_<slice1>_<timestamp>/` with ordered warped files, manifests, logs, and optional reference/working/merged folders.
 
-```text
-HistRegGUI_batch_<fixed>_<timestamp>/
-├── warped/
-│   ├── 001_<moving>_warped_to_<fixed>.tif
-│   └── 002_<moving>_warped_to_<fixed>.tif
-├── intermediate/
-├── merged/
-│   ├── HistRegGUI_registered_stack_<fixed>.ome.tif
-│   └── HistRegGUI_registered_stack_<fixed>_stack.json
-├── registration_manifest.csv
-├── registration_manifest.json
-└── HistRegGUI_error.log
-```
-
-Numbered output filenames prevent collisions when moving images from different folders have the same basename.
-
-When intermediate saving is disabled, successful intermediate directories are removed. A failed item's intermediate directory is retained when available to support troubleshooting.
+Numbered filenames prevent collisions and preserve the requested section order.
 
 ### Optional merged volume
 
-When enabled, HistRegGUI writes a BigTIFF OME-TIFF with axes `ZYXS`. The fixed image can be included as the first slice, followed by successful warped images in the order displayed in the moving-image table. The writer streams 256 × 256 tiles and never constructs the full Z-stack in RAM. Deflate compression and BigTIFF are used for large-image compatibility.
+HistRegGUI writes a tiled, Deflate-compressed BigTIFF OME-TIFF with axes `ZYXS`. The first fixed/reference image can be Z=0, followed by successful warped images in table order. The writer opens one image at a time and yields one 256 × 256 tile at a time; it never constructs the complete volume in RAM.
 
-The merge downsample can be 1×, 2×, 4×, 8×, 16×, or 32×. XY calibration is automatically read when possible or entered manually; output XY pixel size is adjusted for downsampling. Z spacing must be provided in micrometres. A JSON sidecar records Z order and metadata.
+The merge downsample is additional to the registration downsample. For example, a 4× registration downsample plus a 2× merge downsample gives a nominal total reduction of 8×. The retained downsampled reference stores the actual physical X/Y calibration, and Z spacing is supplied in micrometres.
+
+If a cascade fails after a successful prefix, the application may export that prefix as a clearly documented partial stack. The JSON sidecar records every included Z index and original source path.
 
 ## 7. Manifests and error handling
 
 Every run writes CSV and JSON manifests containing:
 
-- fixed and moving input paths;
+- registration mode and registration downsample;
+- original first fixed image and moving inputs;
+- actual registration source and target for every step;
 - output and intermediate paths;
 - selected reader, device, and preset;
 - start and finish timestamps;
-- success or failure status;
+- success, failure, or cascade-dependency skip status;
+- merged-volume settings and output metadata;
 - error text when applicable.
 
 Failures are also appended to `HistRegGUI_error.log` with the Python traceback.
 
 ## 8. Validation
 
-Registration results should be reviewed visually before quantitative analysis. Confirm that corresponding tissue structures, orientation, and specimen region agree between fixed and warped images.
+Registration results should be reviewed visually before quantitative analysis. Confirm that corresponding tissue structures, orientation, specimen region, and cumulative cascade behavior remain plausible. For long series, inspect several checkpoints rather than only the first and final slices.
 
 ## 9. Distribution
 
-GitHub Actions builds the application independently on Windows, Ubuntu, and macOS runners. Version tags matching `v*` publish the generated archives in a GitHub Release.
+GitHub Actions builds the application independently on Windows, Ubuntu, and macOS runners. Version tags matching `v*` publish the generated archives in a GitHub Release. When the public repository is enabled in Zenodo, the GitHub Release for `v1.0` is ingested and receives a DOI.
 
 The application is built with PyInstaller and includes the installed DeeperHistReg package, its resources, and binary image backends needed by the release.
 

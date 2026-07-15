@@ -66,10 +66,16 @@ import torch  # noqa: E402
 import deeperhistreg  # noqa: E402
 
 from histreggui.batch import (  # noqa: E402
+    REGISTRATION_MODE_CASCADE,
+    REGISTRATION_MODE_SAME_TARGET,
+    REGISTRATION_MODES,
     RegistrationBatchPlan,
     RegistrationPlanItem,
     build_registration_batch_plan,
     default_merged_volume_path,
+    default_reference_image_path,
+    normalize_registration_mode,
+    registration_target_for_step,
     unique_paths,
     write_registration_manifest,
 )
@@ -90,6 +96,8 @@ from histreggui.image_io import (  # noqa: E402
 )
 from histreggui.volume import (  # noqa: E402
     VolumeSlice,
+    WorkingImageResult,
+    create_downsampled_registration_tiff,
     create_merged_ome_tiff,
     infer_pixel_size_um,
 )
@@ -207,6 +215,11 @@ class App(tk.Tk):
 
         self.preset_var = tk.StringVar(value=next(iter(PRESETS.keys())))
         self.loader_var = tk.StringVar(value=next(iter(LOADER_CHOICES.keys())))
+        self.registration_mode_var = tk.StringVar(value=next(iter(REGISTRATION_MODES.keys())))
+        self.registration_downsample_var = tk.StringVar(value="1")
+        self.registration_mode_hint_var = tk.StringVar(
+            value="Independent mode: every moving image is registered directly to the fixed target."
+        )
         self.loader_status_var = tk.StringVar(value="Input reader: automatic")
         self.moving_count_var = tk.StringVar(value="No moving images selected.")
         self.save_intermediate_var = tk.BooleanVar(value=False)
@@ -230,6 +243,7 @@ class App(tk.Tk):
         self._build_ui()
         self._update_cuda_controls()
         self._toggle_merge_controls()
+        self._registration_mode_changed()
 
     # ------------------------------------------------------------------ UI --
     def _build_menu(self) -> None:
@@ -256,7 +270,8 @@ class App(tk.Tk):
         top.pack(fill="x", padx=10, pady=(10, 4))
         top.columnconfigure(2, weight=1)
 
-        ttk.Label(top, text="Target (Fixed) image:").grid(row=0, column=0, sticky="w")
+        self.fixed_title_label = ttk.Label(top, text="Target (Fixed) image:")
+        self.fixed_title_label.grid(row=0, column=0, sticky="w")
         self.fixed_button = ttk.Button(top, text="Select...", command=self.select_fixed)
         self.fixed_button.grid(row=0, column=1, padx=8, pady=3, sticky="w")
         self.fixed_lbl = ttk.Label(top, text="(none)")
@@ -313,34 +328,67 @@ class App(tk.Tk):
         moving_scroll.grid(row=0, column=1, sticky="ns")
         self.moving_tree.bind("<<TreeviewSelect>>", self._moving_selection_changed)
 
-        ttk.Label(top, text="Registration preset:").grid(row=3, column=0, sticky="w")
-        preset = ttk.Combobox(
+        ttk.Label(top, text="Registration mode:").grid(row=3, column=0, sticky="w")
+        self.registration_mode_combo = ttk.Combobox(
+            top,
+            textvariable=self.registration_mode_var,
+            values=list(REGISTRATION_MODES.keys()),
+            state="readonly",
+            width=48,
+        )
+        self.registration_mode_combo.grid(row=3, column=1, padx=8, pady=3, sticky="w")
+        self.registration_mode_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._registration_mode_changed()
+        )
+
+        resolution_frame = ttk.Frame(top)
+        resolution_frame.grid(row=3, column=2, sticky="w")
+        ttk.Label(resolution_frame, text="Registration downsample:").pack(side="left")
+        self.registration_downsample_combo = ttk.Combobox(
+            resolution_frame,
+            textvariable=self.registration_downsample_var,
+            values=("1", "2", "4", "8", "16", "32"),
+            state="readonly",
+            width=5,
+        )
+        self.registration_downsample_combo.pack(side="left", padx=(5, 0))
+        self.registration_downsample_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._registration_mode_changed()
+        )
+
+        ttk.Label(top, textvariable=self.registration_mode_hint_var, wraplength=1050).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(0, 5)
+        )
+
+        ttk.Label(top, text="Registration preset:").grid(row=5, column=0, sticky="w")
+        self.preset_combo = ttk.Combobox(
             top,
             textvariable=self.preset_var,
             values=list(PRESETS.keys()),
             state="readonly",
             width=38,
         )
-        preset.grid(row=3, column=1, padx=8, pady=3, sticky="w")
+        self.preset_combo.grid(row=5, column=1, padx=8, pady=3, sticky="w")
 
-        ttk.Checkbutton(
+        self.save_intermediate_check = ttk.Checkbutton(
             top,
-            text="Save intermediate results",
+            text="Save intermediate and temporary working images",
             variable=self.save_intermediate_var,
-        ).grid(row=3, column=2, sticky="w")
+        )
+        self.save_intermediate_check.grid(row=5, column=2, sticky="w")
 
-        ttk.Label(top, text="Input reader:").grid(row=4, column=0, sticky="w")
-        loader_combo = ttk.Combobox(
+        ttk.Label(top, text="Input reader:").grid(row=6, column=0, sticky="w")
+        self.loader_combo = ttk.Combobox(
             top,
             textvariable=self.loader_var,
             values=list(LOADER_CHOICES.keys()),
             state="readonly",
             width=38,
         )
-        loader_combo.grid(row=4, column=1, padx=8, pady=3, sticky="w")
-        loader_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_loader_status())
+        self.loader_combo.grid(row=6, column=1, padx=8, pady=3, sticky="w")
+        self.loader_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_loader_status())
         ttk.Label(top, textvariable=self.loader_status_var).grid(
-            row=4, column=2, sticky="w", padx=(4, 0)
+            row=6, column=2, sticky="w", padx=(4, 0)
         )
 
         self.cuda_check = ttk.Checkbutton(
@@ -349,14 +397,14 @@ class App(tk.Tk):
             variable=self.use_cuda_var,
             command=self._cuda_toggled,
         )
-        self.cuda_check.grid(row=5, column=1, padx=8, pady=(7, 3), sticky="w")
+        self.cuda_check.grid(row=7, column=1, padx=8, pady=(7, 3), sticky="w")
 
         ttk.Label(top, textvariable=self.cuda_status_var).grid(
-            row=5, column=2, sticky="w", padx=(4, 0)
+            row=7, column=2, sticky="w", padx=(4, 0)
         )
 
         merge_frame = ttk.LabelFrame(top, text="Optional merged volume", padding=8)
-        merge_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        merge_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 3))
         merge_frame.columnconfigure(6, weight=1)
         self.create_merge_check = ttk.Checkbutton(
             merge_frame,
@@ -368,12 +416,12 @@ class App(tk.Tk):
 
         self.merge_include_fixed_check = ttk.Checkbutton(
             merge_frame,
-            text="Include fixed target as first Z slice",
+            text="Include first fixed slice as Z=0",
             variable=self.merge_include_fixed_var,
         )
         self.merge_include_fixed_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
-        ttk.Label(merge_frame, text="Downsample:").grid(row=1, column=2, sticky="e", padx=(12, 3), pady=(5, 0))
+        ttk.Label(merge_frame, text="Additional merge downsample:").grid(row=1, column=2, sticky="e", padx=(12, 3), pady=(5, 0))
         self.merge_downsample_combo = ttk.Combobox(
             merge_frame,
             textvariable=self.merge_downsample_var,
@@ -383,7 +431,7 @@ class App(tk.Tk):
         )
         self.merge_downsample_combo.grid(row=1, column=3, sticky="w", pady=(5, 0))
 
-        ttk.Label(merge_frame, text="XY µm/px:").grid(row=1, column=4, sticky="e", padx=(12, 3), pady=(5, 0))
+        ttk.Label(merge_frame, text="Original XY µm/px:").grid(row=1, column=4, sticky="e", padx=(12, 3), pady=(5, 0))
         self.merge_xy_entry = ttk.Entry(merge_frame, textvariable=self.merge_xy_um_var, width=9)
         self.merge_xy_entry.grid(row=1, column=5, sticky="w", pady=(5, 0))
         self.merge_xy_entry.configure(validate="focusout")
@@ -392,7 +440,7 @@ class App(tk.Tk):
         self.merge_z_entry = ttk.Entry(merge_frame, textvariable=self.merge_z_um_var, width=9)
         self.merge_z_entry.grid(row=1, column=7, sticky="w", pady=(5, 0))
 
-        ttk.Label(merge_frame, text="Leave XY empty to read calibration from the fixed image.").grid(
+        ttk.Label(merge_frame, text="Leave XY empty to read calibration from the first fixed slice.").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(4, 0)
         )
         ttk.Label(merge_frame, textvariable=self.merge_hint_var).grid(
@@ -400,7 +448,7 @@ class App(tk.Tk):
         )
 
         self.run_button = ttk.Button(top, text="Run registration", command=self.run_clicked)
-        self.run_button.grid(row=7, column=1, pady=(10, 2), sticky="w")
+        self.run_button.grid(row=9, column=1, pady=(10, 2), sticky="w")
 
         previews = ttk.Frame(self, padding=10)
         previews.pack(fill="both", expand=True)
@@ -451,8 +499,19 @@ class App(tk.Tk):
             self.clear_moving_button,
             self.run_button,
             self.create_merge_check,
+            self.save_intermediate_check,
         ):
             widget.config(state=state)
+        if running:
+            self.registration_mode_combo.config(state="disabled")
+            self.registration_downsample_combo.config(state="disabled")
+            self.preset_combo.config(state="disabled")
+            self.loader_combo.config(state="disabled")
+        else:
+            self.registration_mode_combo.config(state="readonly")
+            self.registration_downsample_combo.config(state="readonly")
+            self.preset_combo.config(state="readonly")
+            self.loader_combo.config(state="readonly")
         if running:
             for widget in (
                 self.merge_include_fixed_check,
@@ -471,6 +530,35 @@ class App(tk.Tk):
         self.merge_xy_entry.config(state=normal_state)
         self.merge_z_entry.config(state=normal_state)
         self.merge_downsample_combo.config(state="readonly" if enabled else "disabled")
+
+    def _registration_mode_changed(self) -> None:
+        mode = normalize_registration_mode(self.registration_mode_var.get())
+        factor = max(1, int(self.registration_downsample_var.get() or "1"))
+        if mode == REGISTRATION_MODE_CASCADE:
+            self.fixed_title_label.config(text="Slice 1 / fixed reference:")
+            hint = (
+                "Cascading mode uses the list as consecutive sections: the first moving image "
+                "is warped to the fixed slice, then every next image is warped to the previous "
+                "successful warped output. The chain stops after a failed step because later "
+                "slices depend on it."
+            )
+        else:
+            self.fixed_title_label.config(text="Target (Fixed) image:")
+            hint = (
+                "Independent mode registers every moving image directly to the same fixed target; "
+                "one failure does not stop the remaining images."
+            )
+        if factor > 1:
+            hint += (
+                f" Registration and warped outputs use streamed {factor}× downsampled OME-TIFF "
+                "working images. This reduces time, RAM, GPU memory, and output size; it does not "
+                "produce a full-resolution warp."
+            )
+        else:
+            hint += " Registration uses the selected source images at their normal output resolution."
+        self.registration_mode_hint_var.set(hint)
+        self._update_loader_status()
+        self._refresh_moving_tree(select_path=self.current_moving_path)
 
     # ------------------------------------------------------------ Hardware --
     def _update_cuda_controls(self) -> None:
@@ -521,7 +609,8 @@ class App(tk.Tk):
             f"PyTorch package: {BUILD_INFO.get('torch_variant', 'unknown')}\n"
             f"PyTorch version: {torch.__version__}\n"
             f"CUDA status: {format_cuda_summary(self.cuda_info)}\n"
-            f"Batch registration: one fixed target with multiple moving images\n"
+            f"Registration modes: independent one-target batch and cascading consecutive slices\n"
+            f"Registration downsample: streamed OME-TIFF working images, 1×–32×\n"
             f"Merged volume: streamed tiled BigTIFF OME-TIFF (ZYXS)\n"
             f"Supported image extensions: {supported_formats_text()}"
         )
@@ -676,14 +765,27 @@ class App(tk.Tk):
             self.moving_tree_iids[key] = iid
 
         count = len(self.moving_paths)
-        self.moving_count_var.set(
-            "No moving images selected."
-            if count == 0
-            else f"{count} moving image{'s' if count != 1 else ''} selected."
-        )
-        self.run_button.config(
-            text="Run registration" if count <= 1 else f"Run registration batch ({count})"
-        )
+        mode = normalize_registration_mode(self.registration_mode_var.get())
+        if count == 0:
+            count_text = "No moving images selected."
+        elif mode == REGISTRATION_MODE_CASCADE:
+            count_text = (
+                f"{count + 1} consecutive slices: 1 fixed first slice + "
+                f"{count} following slice{'s' if count != 1 else ''}."
+            )
+        else:
+            count_text = f"{count} moving image{'s' if count != 1 else ''} selected."
+        self.moving_count_var.set(count_text)
+        if mode == REGISTRATION_MODE_CASCADE:
+            self.run_button.config(
+                text="Run cascading registration"
+                if count <= 1
+                else f"Run cascading registration ({count + 1} slices)"
+            )
+        else:
+            self.run_button.config(
+                text="Run registration" if count <= 1 else f"Run registration batch ({count})"
+            )
 
         if select_path is not None:
             iid = self.moving_tree_iids.get(self._path_key(select_path))
@@ -730,46 +832,78 @@ class App(tk.Tk):
             messagebox.showwarning("Preview unavailable", f"{path}\n\n{exc}")
 
     def _reader_for_moving(self, moving: Path) -> str:
+        factor = max(1, int(self.registration_downsample_var.get() or "1"))
+        if factor > 1:
+            return "tiff (working)"
         if not self.fixed_path:
             key = LOADER_CHOICES.get(self.loader_var.get(), self.loader_var.get())
             return "automatic" if key == "auto" else key
         try:
-            return resolve_loader_choice(self.loader_var.get(), moving, self.fixed_path)
+            index = next(
+                (i for i, path in enumerate(self.moving_paths) if self._path_key(path) == self._path_key(moving)),
+                0,
+            )
+            mode = normalize_registration_mode(self.registration_mode_var.get())
+            target = self.fixed_path
+            if mode == REGISTRATION_MODE_CASCADE and index > 0:
+                # The actual file is created during the run. Its TIFF suffix is
+                # sufficient for deterministic automatic reader selection.
+                target = Path("previous_cascade_warped.tif")
+            return resolve_loader_choice(self.loader_var.get(), moving, target)
         except Exception:
             return "error"
 
     def _update_loader_status(self) -> None:
         choice = self.loader_var.get()
         key = LOADER_CHOICES.get(choice, choice)
+        factor = max(1, int(self.registration_downsample_var.get() or "1"))
+        mode = normalize_registration_mode(self.registration_mode_var.get())
         if self.fixed_path and self.moving_paths:
             readers: list[str] = []
             errors: list[str] = []
-            for moving in self.moving_paths:
+            for index, moving in enumerate(self.moving_paths):
                 try:
-                    reader = resolve_loader_choice(choice, moving, self.fixed_path)
+                    if factor > 1:
+                        reader = "tiff"
+                    else:
+                        target = self.fixed_path
+                        if mode == REGISTRATION_MODE_CASCADE and index > 0:
+                            target = Path("previous_cascade_warped.tif")
+                        reader = resolve_loader_choice(choice, moving, target)
                     readers.append(reader)
-                    self.moving_readers[self._path_key(moving)] = reader
+                    display_reader = f"{reader} (working)" if factor > 1 else reader
+                    self.moving_readers[self._path_key(moving)] = display_reader
                 except Exception as exc:
                     errors.append(str(exc))
                     self.moving_readers[self._path_key(moving)] = "error"
 
             if errors:
                 self.loader_status_var.set(f"Input reader error: {errors[0]}")
+            elif factor > 1:
+                self.loader_status_var.set(
+                    f"Registration reader: TIFF after streamed {factor}× working-image conversion"
+                )
             elif key == "auto":
                 counts = Counter(readers)
                 summary = ", ".join(
                     f"{reader} × {count}" for reader, count in sorted(counts.items())
                 )
-                self.loader_status_var.set(f"Input reader: auto → {summary}")
+                prefix = "Cascade readers" if mode == REGISTRATION_MODE_CASCADE else "Input reader"
+                self.loader_status_var.set(f"{prefix}: auto → {summary}")
             else:
                 self.loader_status_var.set(
                     f"Input reader: {key} for {len(self.moving_paths)} image(s)"
                 )
             self._refresh_moving_tree(select_path=self.current_moving_path)
         else:
-            self.loader_status_var.set(
-                "Input reader: automatic" if key == "auto" else f"Input reader: {key}"
-            )
+            if factor > 1:
+                self.loader_status_var.set(
+                    f"Registration reader: TIFF after streamed {factor}× working-image conversion"
+                )
+            else:
+                self.loader_status_var.set(
+                    "Input reader: automatic" if key == "auto" else f"Input reader: {key}"
+                )
             self._refresh_moving_tree(select_path=self.current_moving_path)
 
     def _set_moving_status_ui(
@@ -800,7 +934,7 @@ class App(tk.Tk):
         if not self.fixed_path or not self.moving_paths:
             messagebox.showwarning(
                 "Missing input",
-                "Please select one fixed image and at least one moving image.",
+                "Please select one fixed/first slice and at least one following moving image.",
             )
             return
 
@@ -823,6 +957,8 @@ class App(tk.Tk):
         preset_key = self.preset_var.get()
         save_intermediate = bool(self.save_intermediate_var.get())
         loader_choice = self.loader_var.get()
+        registration_mode = normalize_registration_mode(self.registration_mode_var.get())
+        registration_downsample = 1
         create_merge = bool(self.create_merge_var.get())
         merge_include_fixed = bool(self.merge_include_fixed_var.get())
         merge_downsample = 1
@@ -830,8 +966,21 @@ class App(tk.Tk):
         merge_z_um = 4.0
 
         try:
-            for moving in moving_paths:
-                resolve_loader_choice(loader_choice, moving, fixed)
+            registration_downsample = int(self.registration_downsample_var.get())
+            if registration_downsample < 1:
+                raise ValueError("Registration downsample must be at least 1.")
+
+            # At factor > 1 every source is converted to a streamed OME-TIFF
+            # working image and the registration reader is therefore TIFF. At
+            # factor 1, validate the actual pair logic, including the TIFF target
+            # created by every cascade step after the first.
+            if registration_downsample == 1:
+                for index, moving in enumerate(moving_paths):
+                    target_hint = fixed
+                    if registration_mode == REGISTRATION_MODE_CASCADE and index > 0:
+                        target_hint = Path("previous_cascade_warped.tif")
+                    resolve_loader_choice(loader_choice, moving, target_hint)
+
             if create_merge:
                 merge_downsample = int(self.merge_downsample_var.get())
                 if merge_downsample < 1:
@@ -852,13 +1001,23 @@ class App(tk.Tk):
             messagebox.showerror("Input/settings error", str(exc))
             return
 
+        if registration_mode == REGISTRATION_MODE_CASCADE and len(moving_paths) > 1:
+            proceed = messagebox.askokcancel(
+                "Confirm cascading slice order",
+                "Cascading registration depends on the exact list order.\n\n"
+                f"Slice 1: {fixed.name}\n"
+                f"Slice 2: {moving_paths[0].name}\n"
+                f"Final slice: {moving_paths[-1].name}\n\n"
+                "Each following slice will be registered to the previous warped slice. "
+                "The chain stops if one step fails. Continue?",
+            )
+            if not proceed:
+                return
+
         self._set_running_controls(True)
         for moving in moving_paths:
-            self._set_moving_status_ui(
-                moving,
-                "Queued",
-                resolve_loader_choice(loader_choice, moving, fixed),
-            )
+            display_reader = "tiff (working)" if registration_downsample > 1 else self._reader_for_moving(moving)
+            self._set_moving_status_ui(moving, "Queued", display_reader)
 
         threading.Thread(
             target=self._run_registration_batch,
@@ -869,6 +1028,8 @@ class App(tk.Tk):
                 save_intermediate,
                 use_cuda,
                 loader_choice,
+                registration_mode,
+                registration_downsample,
                 create_merge,
                 merge_include_fixed,
                 merge_downsample,
@@ -884,6 +1045,8 @@ class App(tk.Tk):
         item: RegistrationPlanItem,
         use_cuda: bool,
         loader_key: str,
+        registration_source: Path,
+        registration_target: Path,
         trace: str,
     ) -> None:
         try:
@@ -891,8 +1054,12 @@ class App(tk.Tk):
             with plan.error_log.open("a", encoding="utf-8") as handle:
                 handle.write("\n" + "=" * 80 + "\n")
                 handle.write(f"[ERROR] {datetime.now().isoformat()}\n")
-                handle.write(f"Fixed:  {plan.fixed_path}\n")
-                handle.write(f"Moving: {item.moving_path}\n")
+                handle.write(f"Registration mode: {plan.registration_mode}\n")
+                handle.write(f"Registration downsample: {plan.registration_downsample}x\n")
+                handle.write(f"First fixed slice: {plan.fixed_path}\n")
+                handle.write(f"Original moving slice: {item.moving_path}\n")
+                handle.write(f"Registration source: {registration_source}\n")
+                handle.write(f"Registration target: {registration_target}\n")
                 handle.write(f"Output: {item.warped_output}\n")
                 handle.write(f"CUDA requested: {use_cuda}\n")
                 handle.write(f"Input reader: {loader_key}\n")
@@ -909,6 +1076,8 @@ class App(tk.Tk):
         save_intermediate: bool,
         use_cuda: bool,
         loader_choice: str,
+        registration_mode: str,
+        registration_downsample: int,
         create_merge: bool,
         merge_include_fixed: bool,
         merge_downsample: int,
@@ -918,10 +1087,21 @@ class App(tk.Tk):
         plan: RegistrationBatchPlan | None = None
         try:
             run_stamp = timestamp()
-            plan = build_registration_batch_plan(fixed, moving_paths, run_stamp)
+            registration_mode = normalize_registration_mode(registration_mode)
+            registration_downsample = int(registration_downsample)
+            plan = build_registration_batch_plan(
+                fixed,
+                moving_paths,
+                run_stamp,
+                registration_mode=registration_mode,
+                registration_downsample=registration_downsample,
+            )
             if plan.batch_root is not None:
-                (plan.batch_root / "warped").mkdir(parents=True, exist_ok=True)
-                (plan.batch_root / "intermediate").mkdir(parents=True, exist_ok=True)
+                plan.output_directory.mkdir(parents=True, exist_ok=True)
+                plan.intermediate_directory.mkdir(parents=True, exist_ok=True)
+                if registration_downsample > 1:
+                    plan.reference_directory.mkdir(parents=True, exist_ok=True)
+                    plan.working_directory.mkdir(parents=True, exist_ok=True)
 
             preset_function = PRESETS[preset_key]
             function_name = getattr(preset_function, "__name__", preset_key)
@@ -931,17 +1111,53 @@ class App(tk.Tk):
             successful_outputs: list[Path] = []
             successful_slices: list[VolumeSlice] = []
             failures: list[tuple[Path, str]] = []
+            skipped_count = 0
+            cascade_stopped_after: int | None = None
+            fixed_work_result: WorkingImageResult | None = None
 
-            for item in plan.items:
+            original_fixed_calibration = (
+                (float(merge_xy_um), float(merge_xy_um))
+                if merge_xy_um is not None
+                else infer_pixel_size_um(fixed)
+            )
+            fixed_registration_path = fixed
+            if registration_downsample > 1:
+                fixed_registration_path = default_reference_image_path(plan)
+                self._set_status(
+                    f"Preparing {registration_downsample}× downsampled first fixed slice ..."
+                )
+                fixed_work_result = create_downsampled_registration_tiff(
+                    fixed,
+                    fixed_registration_path,
+                    downsample=registration_downsample,
+                    source_pixel_size_um=original_fixed_calibration,
+                    tile_size=256,
+                    compression="deflate",
+                    progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                )
+
+            previous_warped_output: Path | None = None
+
+            for position, item in enumerate(plan.items):
                 started_at = datetime.now().isoformat()
-                loader_key = resolve_loader_choice(
-                    loader_choice, item.moving_path, fixed
+                registration_source = item.moving_path
+                registration_target = registration_target_for_step(
+                    registration_mode,
+                    fixed_registration_path,
+                    previous_warped_output,
+                )
+                loader_key = "tiff" if registration_downsample > 1 else resolve_loader_choice(
+                    loader_choice, registration_source, registration_target
                 )
                 result: dict[str, object] = {
                     "index": item.index,
                     "status": "failed",
+                    "registration_mode": registration_mode,
+                    "registration_downsample": registration_downsample,
                     "fixed_image": str(fixed),
                     "moving_image": str(item.moving_path),
+                    "registration_source": str(registration_source),
+                    "registration_target": str(registration_target),
                     "warped_output": str(item.warped_output),
                     "intermediate_directory": str(item.run_directory),
                     "loader": loader_key,
@@ -951,32 +1167,73 @@ class App(tk.Tk):
                     "finished_at": "",
                     "error": "",
                 }
+                step_failed = False
 
                 self._set_moving_status(
                     item.moving_path,
                     f"Running {item.index}/{total}",
-                    loader_key,
+                    f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
                 )
-                if use_cuda:
-                    gpu_name = self.cuda_info.device_names[0]
-                    self._set_status(
-                        f"[{item.index}/{total}] Registering {item.moving_path.name} "
-                        f"with {loader_key} on CUDA: {gpu_name} ..."
-                    )
-                else:
-                    self._set_status(
-                        f"[{item.index}/{total}] Registering {item.moving_path.name} "
-                        f"with {loader_key} on CPU ..."
-                    )
 
                 try:
                     item.warped_output.parent.mkdir(parents=True, exist_ok=True)
                     item.run_directory.mkdir(parents=True, exist_ok=True)
 
+                    if registration_downsample > 1:
+                        if item.working_source is None:
+                            raise RuntimeError("The downsampled working source path was not planned.")
+                        self._set_status(
+                            f"[{item.index}/{total}] Preparing {registration_downsample}× "
+                            f"working image for {item.moving_path.name} ..."
+                        )
+                        create_downsampled_registration_tiff(
+                            item.moving_path,
+                            item.working_source,
+                            downsample=registration_downsample,
+                            source_pixel_size_um=infer_pixel_size_um(item.moving_path),
+                            tile_size=256,
+                            compression="deflate",
+                            progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                        )
+                        registration_source = item.working_source
+                        loader_key = "tiff"
+                        result["registration_source"] = str(registration_source)
+                        result["loader"] = loader_key
+
+                    registration_target = registration_target_for_step(
+                        registration_mode,
+                        fixed_registration_path,
+                        previous_warped_output,
+                    )
+                    result["registration_target"] = str(registration_target)
+                    if registration_downsample == 1:
+                        loader_key = resolve_loader_choice(
+                            loader_choice, registration_source, registration_target
+                        )
+                        result["loader"] = loader_key
+
+                    if use_cuda:
+                        gpu_name = self.cuda_info.device_names[0]
+                        self._set_status(
+                            f"[{item.index}/{total}] Registering {item.moving_path.name} "
+                            f"to {registration_target.name} with {loader_key} on CUDA: {gpu_name} ..."
+                        )
+                    else:
+                        self._set_status(
+                            f"[{item.index}/{total}] Registering {item.moving_path.name} "
+                            f"to {registration_target.name} with {loader_key} on CPU ..."
+                        )
+
                     parameters = configure_registration_device(
                         preset_function(), device  # type: ignore[operator]
                     )
                     parameters = configure_registration_loader(parameters, loader_key)
+                    if registration_downsample > 1 or registration_mode == REGISTRATION_MODE_CASCADE:
+                        loading_params = parameters.setdefault("loading_params", {})
+                        if not isinstance(loading_params, dict):
+                            raise TypeError("registration_parameters['loading_params'] must be a dictionary")
+                        # Working TIFFs and warped cascade targets are single-level images.
+                        loading_params["final_level"] = 0
                     loader = pick_loader_for_warp(loader_key)
 
                     registration = (
@@ -985,7 +1242,9 @@ class App(tk.Tk):
                         )
                     )
                     registration.run_registration(
-                        str(item.moving_path), str(fixed), str(item.run_directory)
+                        str(registration_source),
+                        str(registration_target),
+                        str(item.run_directory),
                     )
 
                     self._set_status(
@@ -1016,8 +1275,8 @@ class App(tk.Tk):
                         f"{item.warped_output.name} ..."
                     )
                     deeperhistreg.apply_deformation(
-                        source_image_path=str(item.moving_path),
-                        target_image_path=str(fixed),
+                        source_image_path=str(registration_source),
+                        target_image_path=str(registration_target),
                         warped_image_path=str(item.warped_output),
                         displacement_field_path=str(displacement_field),
                         loader=loader,
@@ -1046,34 +1305,56 @@ class App(tk.Tk):
                     successful_slices.append(
                         VolumeSlice(
                             path=item.warped_output,
-                            role="warped",
+                            role=(
+                                "cascade_warped"
+                                if registration_mode == REGISTRATION_MODE_CASCADE
+                                else "warped"
+                            ),
                             source_path=item.moving_path,
                             label=f"{item.index:03d}_{item.moving_path.stem}",
                         )
                     )
+                    if registration_mode == REGISTRATION_MODE_CASCADE:
+                        previous_warped_output = item.warped_output
                     self._set_moving_status(
-                        item.moving_path, "Done", loader_key
+                        item.moving_path,
+                        "Done",
+                        f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
                     )
 
                 except Exception as exc:
+                    step_failed = True
                     trace = traceback.format_exc()
                     result["error"] = f"{exc!r}"
                     failures.append((item.moving_path, str(exc)))
                     self._append_error_log(
-                        plan, item, use_cuda, loader_key, trace
+                        plan,
+                        item,
+                        use_cuda,
+                        loader_key,
+                        registration_source,
+                        registration_target,
+                        trace,
                     )
                     short_error = str(exc).strip() or type(exc).__name__
                     if len(short_error) > 90:
                         short_error = short_error[:87] + "..."
                     self._set_moving_status(
-                        item.moving_path, f"Failed: {short_error}", loader_key
+                        item.moving_path,
+                        f"Failed: {short_error}",
+                        f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
                     )
                 finally:
                     result["finished_at"] = datetime.now().isoformat()
                     results.append(result)
+                    if registration_downsample > 1 and item.working_source is not None and not save_intermediate:
+                        try:
+                            item.working_source.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                     # Sequential processing is deliberate. Releasing tensors and
-                    # cached GPU blocks between images avoids batch-wide memory
-                    # growth, especially for large whole-slide registrations.
+                    # cached GPU blocks between slices prevents memory growth even
+                    # for very long consecutive series.
                     gc.collect()
                     if use_cuda:
                         try:
@@ -1081,22 +1362,68 @@ class App(tk.Tk):
                         except Exception:
                             pass
 
+                if step_failed and registration_mode == REGISTRATION_MODE_CASCADE:
+                    cascade_stopped_after = item.index
+                    for skipped in plan.items[position + 1 :]:
+                        skipped_count += 1
+                        reason = (
+                            f"Skipped because cascade step {item.index} failed; "
+                            "the required previous warped target is unavailable."
+                        )
+                        results.append(
+                            {
+                                "index": skipped.index,
+                                "status": "skipped_dependency",
+                                "registration_mode": registration_mode,
+                                "registration_downsample": registration_downsample,
+                                "fixed_image": str(fixed),
+                                "moving_image": str(skipped.moving_path),
+                                "registration_source": str(skipped.working_source or skipped.moving_path),
+                                "registration_target": "",
+                                "warped_output": str(skipped.warped_output),
+                                "intermediate_directory": str(skipped.run_directory),
+                                "loader": "tiff" if registration_downsample > 1 else "auto",
+                                "device": device,
+                                "preset": function_name,
+                                "started_at": "",
+                                "finished_at": datetime.now().isoformat(),
+                                "error": reason,
+                            }
+                        )
+                        self._set_moving_status(
+                            skipped.moving_path,
+                            f"Skipped: cascade depends on failed slice {item.index}",
+                            "tiff (working)" if registration_downsample > 1 else None,
+                        )
+                    break
+
             if plan.batch_root is not None and not save_intermediate:
-                intermediate_root = plan.batch_root / "intermediate"
-                try:
-                    if intermediate_root.exists() and not any(intermediate_root.iterdir()):
-                        intermediate_root.rmdir()
-                except Exception:
-                    pass
+                for directory in (plan.intermediate_directory, plan.working_directory):
+                    try:
+                        if directory.exists() and not any(directory.iterdir()):
+                            directory.rmdir()
+                    except Exception:
+                        pass
 
             merged_volume = None
             merge_error = ""
+            merge_source_xy_um = merge_xy_um
+            if fixed_work_result is not None:
+                if fixed_work_result.pixel_size_x_um and fixed_work_result.pixel_size_y_um:
+                    merge_source_xy_um = (
+                        fixed_work_result.pixel_size_x_um + fixed_work_result.pixel_size_y_um
+                    ) / 2.0
+                else:
+                    adjusted_calibration = infer_pixel_size_um(fixed_registration_path)
+                    if adjusted_calibration is not None:
+                        merge_source_xy_um = sum(adjusted_calibration) / 2.0
+
             if create_merge and successful_slices:
                 merge_slices: list[VolumeSlice] = []
                 if merge_include_fixed:
                     merge_slices.append(
                         VolumeSlice(
-                            path=fixed,
+                            path=fixed_registration_path,
                             role="fixed",
                             source_path=fixed,
                             label=f"000_fixed_{fixed.stem}",
@@ -1112,7 +1439,7 @@ class App(tk.Tk):
                         merge_path,
                         merge_slices,
                         downsample=merge_downsample,
-                        voxel_xy_um=merge_xy_um,
+                        voxel_xy_um=merge_source_xy_um,
                         voxel_z_um=merge_z_um,
                         tile_size=256,
                         compression="deflate",
@@ -1133,36 +1460,55 @@ class App(tk.Tk):
                 merge_error = "No successful warped images were available for the merged stack."
 
             run_summary: dict[str, object] = {
+                "registration_mode": registration_mode,
+                "registration_downsample": registration_downsample,
+                "fixed_registration_image": str(fixed_registration_path),
+                "fixed_working_image": fixed_work_result.to_dict() if fixed_work_result else None,
                 "registration_success_count": len(successful_outputs),
                 "registration_failure_count": len(failures),
+                "registration_skipped_dependency_count": skipped_count,
+                "cascade_stopped_after_step": cascade_stopped_after,
                 "merged_volume_requested": create_merge,
                 "merged_volume": merged_volume.to_dict() if merged_volume is not None else None,
                 "merged_volume_error": merge_error,
                 "merged_volume_include_fixed": merge_include_fixed if create_merge else False,
-                "merged_volume_downsample": merge_downsample if create_merge else None,
-                "merged_volume_source_xy_um": merge_xy_um if create_merge else None,
+                "merged_volume_additional_downsample": merge_downsample if create_merge else None,
+                "merged_volume_total_nominal_downsample": (
+                    registration_downsample * merge_downsample if create_merge else None
+                ),
+                "merged_volume_source_xy_um": merge_source_xy_um if create_merge else None,
                 "merged_volume_z_um": merge_z_um if create_merge else None,
             }
             write_registration_manifest(plan, results, run_summary=run_summary)
 
             success_count = len(successful_outputs)
             failure_count = len(failures)
-            if plan.is_batch:
-                destination_text = f"Batch folder:\n{plan.batch_root}"
+            if plan.batch_root is not None:
+                destination_text = f"Run folder:\n{plan.batch_root}"
             elif successful_outputs:
                 destination_text = f"Warped image:\n{successful_outputs[0]}"
             else:
                 destination_text = f"Output folder:\n{fixed.parent}"
 
+            mode_text = (
+                "Cascading consecutive slices"
+                if registration_mode == REGISTRATION_MODE_CASCADE
+                else "Independent registrations to one fixed target"
+            )
             summary = (
-                f"Completed {len(plan.items)} registration(s).\n\n"
+                f"Mode: {mode_text}\n"
+                f"Registration downsample: {registration_downsample}×\n\n"
+                f"Planned registration steps: {len(plan.items)}\n"
                 f"Successful: {success_count}\n"
-                f"Failed: {failure_count}\n\n"
+                f"Failed: {failure_count}\n"
+                f"Skipped because of cascade dependency: {skipped_count}\n\n"
                 f"{destination_text}\n\n"
                 f"CSV manifest:\n{plan.manifest_csv}\n"
                 f"JSON manifest:\n{plan.manifest_json}\n\n"
                 f"Execution device: {device}"
             )
+            if fixed_work_result is not None:
+                summary += f"\nDownsampled first/reference slice:\n{fixed_work_result.path}"
             if merged_volume is not None:
                 summary += (
                     f"\n\nMerged OME-TIFF stack:\n{merged_volume.path}"
@@ -1170,36 +1516,34 @@ class App(tk.Tk):
                     f"\nShape: Z={merged_volume.z_slices}, Y={merged_volume.height}, "
                     f"X={merged_volume.width}, RGB"
                 )
+                if cascade_stopped_after is not None:
+                    summary += (
+                        "\nThe merged stack contains only the successfully completed "
+                        "cascade prefix before the failed step."
+                    )
             elif create_merge:
                 summary += f"\n\nMerged stack was not created: {merge_error}"
-            if failures or merge_error:
+            if failures or merge_error or skipped_count:
                 summary += f"\n\nError log:\n{plan.error_log}"
 
-            if failure_count == 0 and not merge_error:
+            if failure_count == 0 and skipped_count == 0 and not merge_error:
                 self._set_status(
                     f"Done. {success_count} registration(s) saved. Manifest: "
                     f"{plan.manifest_csv}"
                 )
                 self._ui(messagebox.showinfo, "Registration complete", summary)
             elif success_count > 0:
-                if failure_count == 0 and merge_error:
-                    self._set_status(
-                        f"Registrations completed, but the merged stack failed: {merge_error}"
-                    )
-                    warning_title = "Registration complete; merge warning"
-                else:
-                    self._set_status(
-                        f"Completed with errors: {success_count} succeeded, "
-                        f"{failure_count} failed."
-                    )
-                    warning_title = "Batch completed with errors"
+                self._set_status(
+                    f"Completed with warnings: {success_count} succeeded, "
+                    f"{failure_count} failed, {skipped_count} skipped."
+                )
                 self._ui(
                     messagebox.showwarning,
-                    warning_title,
+                    "Registration completed with warnings",
                     summary,
                 )
             else:
-                self._set_status("All registrations failed.")
+                self._set_status("Registration failed before a warped slice could be completed.")
                 self._ui(messagebox.showerror, "Registration failed", summary)
 
         except Exception as exc:
@@ -1217,13 +1561,14 @@ class App(tk.Tk):
                 pass
             self._show_error(
                 "Registration error",
-                "The registration batch could not be completed.\n\n"
+                "The registration run could not be completed.\n\n"
                 f"Error: {exc!r}\n\n"
                 f"Full traceback:\n{trace}\n\n"
                 f"Log saved to:\n{log_path}",
             )
         finally:
             self._ui(self._set_running_controls, False)
+
 
 def _self_test_output_path(argv: list[str]) -> Path | None:
     """Return the optional path supplied after ``--self-test-output``."""
@@ -1261,9 +1606,21 @@ def run_self_test(output_path: Path | None = None) -> None:
     )
     if len(batch_probe.items) != 2 or not batch_probe.is_batch:
         raise RuntimeError("Batch registration planning is unavailable.")
-    merge_probe = default_merged_volume_path(batch_probe)
+    cascade_probe = build_registration_batch_plan(
+        Path("slice_001.tif"),
+        [Path("slice_002.tif"), Path("slice_003.tif")],
+        "self_test",
+        registration_mode=REGISTRATION_MODE_CASCADE,
+        registration_downsample=4,
+    )
+    if not cascade_probe.is_cascade or cascade_probe.items[0].working_source is None:
+        raise RuntimeError("Cascading/downsampled registration planning is unavailable.")
+    merge_probe = default_merged_volume_path(cascade_probe)
     if not merge_probe.name.lower().endswith(".ome.tif"):
         raise RuntimeError("Merged OME-TIFF output planning is unavailable.")
+    reference_probe = default_reference_image_path(cascade_probe)
+    if not reference_probe.name.lower().endswith(".ome.tif"):
+        raise RuntimeError("Downsampled reference-image planning is unavailable.")
 
     payload = {
         "status": "ok",
@@ -1277,6 +1634,8 @@ def run_self_test(output_path: Path | None = None) -> None:
         "pillow_tkinter_finder": "ok",
         "pillow_tkinter_finder_alias": "ok",
         "batch_registration": "ok",
+        "cascading_registration": "ok",
+        "streamed_registration_downsample": "ok",
         "streamed_merged_ome_tiff": "ok",
     }
     serialized = json.dumps(payload, indent=2)

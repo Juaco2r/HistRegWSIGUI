@@ -5,9 +5,11 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+import pytest
 
 from histreggui.volume import (
     VolumeSlice,
+    create_downsampled_registration_tiff,
     create_merged_ome_tiff,
     estimate_uncompressed_size_bytes,
     infer_pixel_size_um,
@@ -104,3 +106,42 @@ def test_infer_ome_pixel_size_and_size_estimate(tmp_path: Path) -> None:
     )
     assert infer_pixel_size_um(path) == (0.24, 0.25)
     assert estimate_uncompressed_size_bytes(4, 400, 200, downsample=2) == 4 * 200 * 100 * 3
+
+
+def test_streamed_registration_working_image_preserves_actual_calibration(tmp_path: Path) -> None:
+    source = tmp_path / "odd_size.ome.tif"
+    array = np.zeros((31, 35, 3), dtype=np.uint8)
+    array[..., 2] = 90
+    tifffile.imwrite(
+        source,
+        array,
+        ome=True,
+        photometric="rgb",
+        metadata={
+            "axes": "YXS",
+            "PhysicalSizeX": 0.5,
+            "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeY": 0.6,
+            "PhysicalSizeYUnit": "µm",
+        },
+    )
+
+    output = tmp_path / "working_ds4.ome.tif"
+    result = create_downsampled_registration_tiff(
+        source,
+        output,
+        downsample=4,
+        tile_size=16,
+    )
+
+    assert (result.height, result.width) == (8, 9)
+    assert result.scale_x == 35 / 9
+    assert result.scale_y == 31 / 8
+    with tifffile.TiffFile(output) as tif:
+        assert tif.is_bigtiff
+        assert tif.ome_metadata is not None
+        assert tif.series[0].shape == (8, 9, 3)
+    calibration = infer_pixel_size_um(output)
+    assert calibration is not None
+    assert calibration[0] == pytest.approx(0.5 * (35 / 9))
+    assert calibration[1] == pytest.approx(0.6 * (31 / 8))

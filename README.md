@@ -25,54 +25,100 @@ runtime and NVIDIA libraries. The manual workflow input still allows `none`,
 
 ## Quick start
 
-1. Select the single **Target (Fixed)** image.
-2. Use **Add images...** to select one or several **Moving** images.
-3. Leave **Input reader** on **Auto (recommended)** or select a reader manually.
-4. Choose a registration preset.
-5. Use **Move up** and **Move down** to place moving images in the intended Z order.
-6. Optionally keep intermediate outputs.
-7. Optionally enable **Create merged OME-TIFF stack after registration**. Configure whether the fixed target is the first Z slice, the output downsample, XY calibration, and Z spacing.
-8. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
-9. Select **Run registration** or **Run registration batch**.
+1. Select the **Target (Fixed)** image. In cascading mode this is **Slice 1**.
+2. Use **Add images...** to select the following moving images. Their table order is the slice order.
+3. Choose a registration mode:
+   - **Independent**: every moving image is registered directly to the same fixed target.
+   - **Cascading**: Slice 2 is warped to Slice 1, Slice 3 is warped to the already warped Slice 2, and this continues through the ordered series.
+4. Choose **Registration downsample** from 1× to 32×. Values above 1 create streamed tiled OME-TIFF working images and produce warped outputs at that reduced resolution.
+5. Leave **Input reader** on **Auto (recommended)** or select a reader manually. Downsampled working images use the TIFF reader automatically.
+6. Choose a registration preset.
+7. Use **Move up** and **Move down** to correct the consecutive Z order.
+8. Optionally retain intermediate/temporary working images.
+9. Optionally enable **Create merged OME-TIFF stack after registration**. Configure fixed-slice inclusion, additional merge downsample, original XY calibration, and Z spacing.
+10. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
+11. Start the independent batch or cascading registration.
 
-With one moving image, the warped image is saved next to the fixed image as:
+There is no application-level slice-count limit. Registrations are performed one
+at a time and the final volume is written one tile at a time, so the practical
+limits are processing time, disk capacity, and the operating system's file
+selection limits rather than RAM proportional to the number of slices.
+
+The original single-image, full-resolution independent output remains:
 
 ```text
 <moving>_warped_to_<fixed>.tif
 ```
 
-With several moving images, HistRegGUI processes them sequentially against the
-same fixed target and creates a timestamped folder:
+Independent multi-image runs create:
 
 ```text
 HistRegGUI_batch_<fixed>_<timestamp>/
 ├── warped/
 │   ├── 001_<moving>_warped_to_<fixed>.tif
 │   └── 002_<moving>_warped_to_<fixed>.tif
-├── intermediate/                 # only retained when requested or after a failure
-├── merged/                       # when merged-volume export is enabled
-│   ├── HistRegGUI_registered_stack_<fixed>.ome.tif
-│   └── HistRegGUI_registered_stack_<fixed>_stack.json
+├── intermediate/
+├── merged/
 ├── registration_manifest.csv
 ├── registration_manifest.json
-└── HistRegGUI_error.log          # when registration or stack creation fails
+└── HistRegGUI_error.log
 ```
 
-Batch processing is sequential by design so GPU and system memory are released
-between large registrations. A failed moving image is recorded and the remaining
-images continue processing.
+Cascading runs always receive a dedicated folder because every step depends on
+the previous warped output:
+
+```text
+HistRegGUI_cascade_<slice1>_<timestamp>/
+├── reference/
+│   └── 000_fixed_<slice1>_regds4.ome.tif   # only when registration downsample > 1
+├── warped/
+│   ├── 001_<slice2>_cascaded_to_000_<slice1>_regds4.tif
+│   ├── 002_<slice3>_cascaded_to_001_<slice2>_regds4.tif
+│   └── ...
+├── working/                               # retained only when requested
+├── intermediate/                          # retained when requested or after failure
+├── merged/
+│   ├── HistRegGUI_cascade_stack_<slice1>.ome.tif
+│   └── HistRegGUI_cascade_stack_<slice1>_stack.json
+├── registration_manifest.csv
+├── registration_manifest.json
+└── HistRegGUI_error.log
+```
+
+A cascading failure stops the chain. Later slices are marked
+`skipped_dependency`, because registering them to a different target would no
+longer represent the requested consecutive sequence. A successful prefix can
+still be exported as a clearly documented partial merged stack.
 
 ![Hist Reg App Screenshot](assets/screenshots/DeeperHistReg.png)
 
+
+## Cascading consecutive-slice registration
+
+Cascading mode follows the ordered dependency chain `Slice 2 → Slice 1`,
+`Slice 3 → warped Slice 2`, `Slice 4 → warped Slice 3`, and so on. Each output
+therefore remains in the coordinate system propagated from the first slice,
+while every local registration compares anatomically adjacent sections. This is
+useful for long histological series where direct registration of distant slices
+to one reference may be less stable. As with any cascade, local errors and
+resampling effects can accumulate, so the CSV/JSON manifest records the exact
+source and actual target used at every step.
+
+Registration downsampling is performed before DeeperHistReg runs. HistRegGUI
+creates each moving working image only when its turn begins, registers it, then
+removes the temporary copy unless retention was requested. The downsampled first
+reference is retained because it defines the output geometry and can be included
+as Z=0. This keeps disk and memory usage bounded for very long sequences.
 
 ## One target, multiple moving images
 
 The moving-image table supports multi-file selection, duplicate prevention,
 removal/clearing, per-image reader display, queue/running/success/failure status,
-and click-to-preview. Automatic reader selection is resolved independently for
-each moving/fixed pair, so one batch may use different readers for TIFF, WSI,
-raster, or mixed-format inputs. The latest successful warped image is displayed
-in the result preview.
+and click-to-preview. In independent mode, automatic reader selection is resolved
+for each moving/fixed pair. In cascading mode it is resolved for the actual
+source/previous-warped-target pair at each step. A run may therefore use
+different readers for TIFF, WSI, raster, or mixed-format inputs. The latest
+successful warped image is displayed in the result preview.
 
 Each run writes CSV and JSON manifests containing the source path, output path,
 reader, device, preset, timestamps, and error status for every moving image.
@@ -89,7 +135,7 @@ The stack order is explicit:
 
 The writer uses 256 × 256 tiles, Deflate compression, and BigTIFF. It opens one source at a time and yields one small tile at a time to `tifffile`; it does not create a complete in-memory volume. A partial file is removed if writing fails, and the completed file is structurally checked for BigTIFF, OME-XML, axes, and shape before it replaces the final path.
 
-For large WSI datasets, the default merge downsample is 4×. Available values are 1×, 2×, 4×, 8×, 16×, and 32×. XY pixel size is read from OME-TIFF, TIFF resolution tags, OpenSlide metadata, or libvips when possible; it can also be entered manually. Output XY calibration is multiplied by the selected downsample. Z spacing is user-editable and defaults to 4 µm.
+For large WSI datasets, the default **additional merge downsample** is 4×. Available values are 1×, 2×, 4×, 8×, 16×, and 32×. When registration itself used a downsample, the nominal total reduction is `registration downsample × merge downsample`. XY pixel size is read from OME-TIFF, TIFF resolution tags, OpenSlide metadata, or libvips when possible; it can also be entered manually. The downsampled reference records the actual X/Y scale after integer dimension rounding, and the merged output applies the additional merge factor. Z spacing is user-editable and defaults to 4 µm.
 
 A JSON sidecar beside the OME-TIFF records every Z index, fixed/warped role, original source path, reader backend, physical calibration, output shape, tile size, compression, and downsample. The registration JSON manifest also records whether stack creation succeeded.
 
