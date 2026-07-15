@@ -1,5 +1,8 @@
 # Application and packaging dependencies. PyTorch is installed separately in
 # GitHub Actions so CPU and CUDA variants can be selected explicitly.
+# setuptools 82 removed pkg_resources, while PyInstaller's pkg_resources
+# runtime hook still requires pkg_resources.NullProvider.
+setuptools==81.0.0
 deeperhistreg==1.0.1
 Pillow>=10.4
 requests>=2.31
@@ -20,5 +23,5 @@ torchio>=0.20
 openslide-python>=1.4
 openslide-bin>=4.0
 pyvips[binary]>=3.0
-pyinstaller>=6.18,<7
+pyinstaller==6.21.0
 pytest>=8,<9

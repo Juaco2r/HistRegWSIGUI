@@ -30,12 +30,32 @@ def package_exists(name: str) -> bool:
         return False
 
 
+
+
+def validate_pkg_resources_compatibility() -> None:
+    """Fail early when setuptools no longer provides PyInstaller's API."""
+    try:
+        import pkg_resources
+    except ImportError as exc:
+        raise RuntimeError(
+            "pkg_resources is unavailable. Install setuptools==81.0.0 before building."
+        ) from exc
+
+    if not hasattr(pkg_resources, "NullProvider"):
+        raise RuntimeError(
+            "The installed pkg_resources does not provide NullProvider. "
+            "PyInstaller's runtime hook requires setuptools==81.0.0 for this build."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--platform-label", default=platform.system().lower())
     parser.add_argument("--architecture", default=platform.machine().lower())
     args = parser.parse_args()
+
+    validate_pkg_resources_compatibility()
 
     build_root = REPOSITORY_ROOT / "build"
     dist_root = REPOSITORY_ROOT / "dist"
