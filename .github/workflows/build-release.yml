@@ -20,54 +20,91 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare-matrix:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+
+    steps:
+      - name: Select build targets
+        id: targets
+        env:
+          INCLUDE_CUDA: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cuda }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          targets = [
+              {
+                  "runner": "windows-latest",
+                  "asset_platform": "Windows",
+                  "platform_label": "windows",
+                  "architecture": "x64",
+                  "variant": "cpu",
+                  "torch_index": "cpu",
+              },
+              {
+                  "runner": "ubuntu-22.04",
+                  "asset_platform": "Linux",
+                  "platform_label": "linux",
+                  "architecture": "x64",
+                  "variant": "cpu",
+                  "torch_index": "cpu",
+              },
+              {
+                  "runner": "macos-15-intel",
+                  "asset_platform": "macOS",
+                  "platform_label": "macos",
+                  "architecture": "Intel-x64",
+                  "variant": "cpu",
+                  "torch_index": "macos",
+              },
+              {
+                  "runner": "macos-15",
+                  "asset_platform": "macOS",
+                  "platform_label": "macos",
+                  "architecture": "Apple-Silicon",
+                  "variant": "cpu",
+                  "torch_index": "macos",
+              },
+          ]
+
+          if os.environ.get("INCLUDE_CUDA", "").lower() == "true":
+              targets.extend(
+                  [
+                      {
+                          "runner": "windows-latest",
+                          "asset_platform": "Windows",
+                          "platform_label": "windows",
+                          "architecture": "x64",
+                          "variant": "cuda",
+                          "torch_index": "cu118",
+                      },
+                      {
+                          "runner": "ubuntu-22.04",
+                          "asset_platform": "Linux",
+                          "platform_label": "linux",
+                          "architecture": "x64",
+                          "variant": "cuda",
+                          "torch_index": "cu118",
+                      },
+                  ]
+              )
+
+          matrix = json.dumps({"include": targets}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"matrix={matrix}\n")
+          PY
+
   build:
     name: ${{ matrix.asset_platform }} ${{ matrix.architecture }} ${{ matrix.variant }}
-    if: github.event_name != 'workflow_dispatch' || matrix.variant == 'cpu' || inputs.build_cuda
+    needs: prepare-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            asset_platform: Windows
-            platform_label: windows
-            architecture: x64
-            variant: cpu
-            torch_index: cpu
-
-          - runner: ubuntu-22.04
-            asset_platform: Linux
-            platform_label: linux
-            architecture: x64
-            variant: cpu
-            torch_index: cpu
-
-          - runner: macos-15-intel
-            asset_platform: macOS
-            platform_label: macos
-            architecture: Intel-x64
-            variant: cpu
-            torch_index: macos
-
-          - runner: macos-15
-            asset_platform: macOS
-            platform_label: macos
-            architecture: Apple-Silicon
-            variant: cpu
-            torch_index: macos
-
-          - runner: windows-latest
-            asset_platform: Windows
-            platform_label: windows
-            architecture: x64
-            variant: cuda
-            torch_index: cu118
-
-          - runner: ubuntu-22.04
-            asset_platform: Linux
-            platform_label: linux
-            architecture: x64
-            variant: cuda
-            torch_index: cu118
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
