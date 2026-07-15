@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.1] - 2026-07-15
+
+### Fixed
+- macOS Intel now uses the last officially published Intel-compatible PyTorch pair: 2.2.2 and torchvision 0.17.2.
+- macOS windowed self-tests write their result to a file instead of requiring a console stream.
+- macOS application bundles are ad-hoc signed and verified before packaging.
+- GitHub Actions dependencies were updated to Node.js 24-compatible major versions.
+
+### Changed
+- CUDA builds are opt-in per platform and disabled by default because standalone CUDA archives are approximately 3 GB.
+- Ordinary tag pushes publish CPU applications only; CUDA can be added by manually dispatching the workflow on the tag.
+- Packaged smoke-test failures now print captured stdout and stderr for easier diagnosis.
+
 ## [1.1.0] - 2026-07-15
 
 ### Added

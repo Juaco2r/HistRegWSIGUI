@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,16 +26,61 @@ def main() -> None:
     if not executable.exists():
         raise FileNotFoundError(f"Packaged executable not found: {executable}")
 
+    result_file = ROOT / "build" / "packaged-self-test.json"
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    result_file.unlink(missing_ok=True)
+
+    env = os.environ.copy()
+    # Prevent an already-frozen parent environment from being inherited if this
+    # script is ever called from another packaged process.
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
     result = subprocess.run(
-        [str(executable), "--self-test"],
+        [
+            str(executable),
+            "--self-test",
+            "--self-test-output",
+            str(result_file),
+        ],
         cwd=executable.parent,
-        timeout=180,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=240,
         check=False,
     )
+
+    if result.stdout:
+        print("--- packaged stdout ---")
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print("--- packaged stderr ---", file=sys.stderr)
+        print(result.stderr.rstrip(), file=sys.stderr)
+
     if result.returncode != 0:
         raise RuntimeError(
-            f"Packaged executable self-test failed with exit code {result.returncode}."
+            "Packaged executable self-test failed with exit code "
+            f"{result.returncode}. See stdout/stderr above."
         )
+
+    if not result_file.exists():
+        raise RuntimeError(
+            "Packaged executable exited successfully but did not create the "
+            f"self-test result file: {result_file}"
+        )
+
+    try:
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Invalid packaged self-test result: {exc}") from exc
+
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"Packaged self-test reported failure: {payload}")
+    if int(payload.get("preset_count", 0)) < 1:
+        raise RuntimeError(f"No registration presets were packaged: {payload}")
+
+    print(json.dumps(payload, indent=2))
     print(f"Packaged executable self-test passed: {executable}")
 
 

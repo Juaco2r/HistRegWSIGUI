@@ -531,30 +531,52 @@ class App(tk.Tk):
             self._ui(self.run_button.config, state="normal")
 
 
-def run_self_test() -> None:
-    """Validate imports, resources and basic hardware inspection without opening Tk."""
+def _self_test_output_path(argv: list[str]) -> Path | None:
+    """Return the optional path supplied after ``--self-test-output``."""
+
+    try:
+        index = argv.index("--self-test-output")
+    except ValueError:
+        return None
+
+    if index + 1 >= len(argv):
+        raise ValueError("--self-test-output requires a file path")
+    return Path(argv[index + 1]).expanduser().resolve()
+
+
+def run_self_test(output_path: Path | None = None) -> None:
+    """Validate imports and resources without opening a Tk window.
+
+    PyInstaller's ``--windowed`` mode may set ``sys.stdout`` and ``sys.stderr``
+    to ``None`` on macOS. Writing the result to a file makes the smoke test
+    reliable for both Intel and Apple Silicon application bundles.
+    """
 
     if not PRESETS:
         raise RuntimeError("No DeeperHistReg registration presets were discovered.")
+
     info = detect_cuda(torch, probe=False)
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "preset_count": len(PRESETS),
-                "build": BUILD_INFO,
-                "torch_version": str(torch.__version__),
-                "cuda_compiled": info.compiled_with_cuda,
-                "cuda_available": info.available,
-            },
-            indent=2,
-        )
-    )
+    payload = {
+        "status": "ok",
+        "preset_count": len(PRESETS),
+        "build": BUILD_INFO,
+        "torch_version": str(torch.__version__),
+        "cuda_compiled": info.compiled_with_cuda,
+        "cuda_available": info.available,
+    }
+    serialized = json.dumps(payload, indent=2)
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(serialized + "\n", encoding="utf-8")
+
+    if sys.stdout is not None:
+        print(serialized)
 
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        run_self_test()
+        run_self_test(_self_test_output_path(sys.argv))
     else:
         Image.MAX_IMAGE_PIXELS = None
         App().mainloop()

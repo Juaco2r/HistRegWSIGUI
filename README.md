@@ -8,16 +8,14 @@ The application runs on **Windows, macOS and Linux**. CPU remains the default ex
 
 ## Downloads
 
-GitHub Actions creates these release assets when a tag such as `v1.1.0` is pushed:
+A normal version tag such as `v1.1.0` creates the four smaller CPU assets:
 
 - `HistRegGUI-Windows-x64-CPU.zip`
-- `HistRegGUI-Windows-x64-CUDA.zip`
 - `HistRegGUI-Linux-x64-CPU.tar.gz`
-- `HistRegGUI-Linux-x64-CUDA.tar.gz`
 - `HistRegGUI-macOS-Intel-x64-CPU.zip`
 - `HistRegGUI-macOS-Apple-Silicon-CPU.zip`
 
-The CPU downloads do not require an NVIDIA GPU or CUDA. The CUDA downloads contain a CUDA-enabled PyTorch runtime, but still run in CPU mode by default and can also be opened on a system without an NVIDIA GPU.
+CUDA packages for Windows and Linux are optional manual builds. A fully standalone CUDA package includes PyTorch and NVIDIA runtime libraries and is therefore approximately 2.7–3.1 GB. It still starts in CPU mode and only uses the GPU after the user enables CUDA.
 
 ## Quick start
 
@@ -60,8 +58,8 @@ The workflow is located at:
 
 It can be started in two ways:
 
-- **Actions → Build desktop releases → Run workflow** for test artifacts.
-- Push a version tag such as `v1.1.0` to build every platform and publish the archives in a GitHub Release.
+- **Actions → Build desktop releases → Run workflow** for test artifacts. The `cuda_target` selector defaults to `none` and can optionally build Windows CUDA, Linux CUDA, or both.
+- Push a version tag such as `v1.1.0` to build the four CPU applications and publish them in a GitHub Release.
 
 Example:
 
@@ -73,7 +71,9 @@ git push origin main
 git push origin v1.1.0
 ```
 
-Manual workflow runs include a switch for skipping the large CUDA packages. Tag builds create CPU and CUDA editions automatically. Every job launches the packaged application in a non-GUI self-test mode before uploading it.
+CUDA is intentionally not built on ordinary tag pushes because each standalone CUDA archive is close to 3 GB. To attach CUDA to a release, open **Run workflow**, select the existing tag as the workflow ref, and choose `windows`, `linux`, or `both` under `cuda_target`.
+
+Every job launches the packaged application in a non-GUI self-test mode before uploading it. macOS bundles are also ad-hoc signed and verified during the build. Intel macOS uses PyTorch 2.2.2 because newer official Intel wheels are no longer published.
 
 ## Why DeeperHistReg is installed during the build
 
@@ -103,9 +103,9 @@ Registration failures are appended to:
 HistRegGUI_error.log
 ```
 
-macOS applications produced by public GitHub Actions are unsigned. On first launch, macOS may require the usual **Open** confirmation from Finder or Privacy & Security.
+macOS applications are ad-hoc signed but are not notarized with an Apple Developer ID. On first launch, macOS may still require the usual **Open** confirmation from Finder or Privacy & Security.
 
-CUDA packages are considerably larger than CPU packages because they include the NVIDIA CUDA runtime libraries used by PyTorch. The workflow uses the CUDA 11.8 wheel to maximize compatibility with supported NVIDIA drivers.
+CUDA packages are considerably larger than CPU packages because they include the CUDA-enabled PyTorch runtime, cuDNN, cuBLAS, and related NVIDIA libraries. This is expected for a self-contained application; changing GitHub artifact compression does not meaningfully reduce these binary files. The workflow uses CUDA 11.8 for broad driver compatibility.
 
 ## Licensing
 

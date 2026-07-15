@@ -3,11 +3,16 @@ name: Build desktop releases
 on:
   workflow_dispatch:
     inputs:
-      build_cuda:
-        description: Build the optional CUDA editions for Windows and Linux
-        required: false
-        type: boolean
-        default: true
+      cuda_target:
+        description: "Optional large CUDA build (~3 GB): none, Windows, Linux, or both"
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - windows
+          - linux
+          - both
   push:
     tags:
       - "v*"
@@ -30,7 +35,10 @@ jobs:
       - name: Select build targets
         id: targets
         env:
-          INCLUDE_CUDA: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cuda }}
+          # Tag pushes intentionally publish the smaller CPU applications only.
+          # To publish CUDA for a tag, manually dispatch this workflow while
+          # selecting that tag as the ref and choose the desired CUDA target.
+          CUDA_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.cuda_target || 'none' }}
         shell: bash
         run: |
           python - <<'PY'
@@ -45,6 +53,8 @@ jobs:
                   "architecture": "x64",
                   "variant": "cpu",
                   "torch_index": "cpu",
+                  "torch_version": "2.5.1",
+                  "torchvision_version": "0.20.1",
               },
               {
                   "runner": "ubuntu-22.04",
@@ -53,6 +63,8 @@ jobs:
                   "architecture": "x64",
                   "variant": "cpu",
                   "torch_index": "cpu",
+                  "torch_version": "2.5.1",
+                  "torchvision_version": "0.20.1",
               },
               {
                   "runner": "macos-15-intel",
@@ -61,6 +73,9 @@ jobs:
                   "architecture": "Intel-x64",
                   "variant": "cpu",
                   "torch_index": "macos",
+                  # PyTorch stopped publishing macOS Intel wheels after 2.2.x.
+                  "torch_version": "2.2.2",
+                  "torchvision_version": "0.17.2",
               },
               {
                   "runner": "macos-15",
@@ -69,34 +84,43 @@ jobs:
                   "architecture": "Apple-Silicon",
                   "variant": "cpu",
                   "torch_index": "macos",
+                  "torch_version": "2.5.1",
+                  "torchvision_version": "0.20.1",
               },
           ]
 
-          if os.environ.get("INCLUDE_CUDA", "").lower() == "true":
-              targets.extend(
-                  [
-                      {
-                          "runner": "windows-latest",
-                          "asset_platform": "Windows",
-                          "platform_label": "windows",
-                          "architecture": "x64",
-                          "variant": "cuda",
-                          "torch_index": "cu118",
-                      },
-                      {
-                          "runner": "ubuntu-22.04",
-                          "asset_platform": "Linux",
-                          "platform_label": "linux",
-                          "architecture": "x64",
-                          "variant": "cuda",
-                          "torch_index": "cu118",
-                      },
-                  ]
+          cuda_target = os.environ.get("CUDA_TARGET", "none").strip().lower()
+          if cuda_target in {"windows", "both"}:
+              targets.append(
+                  {
+                      "runner": "windows-latest",
+                      "asset_platform": "Windows",
+                      "platform_label": "windows",
+                      "architecture": "x64",
+                      "variant": "cuda",
+                      "torch_index": "cu118",
+                      "torch_version": "2.5.1",
+                      "torchvision_version": "0.20.1",
+                  }
+              )
+          if cuda_target in {"linux", "both"}:
+              targets.append(
+                  {
+                      "runner": "ubuntu-22.04",
+                      "asset_platform": "Linux",
+                      "platform_label": "linux",
+                      "architecture": "x64",
+                      "variant": "cuda",
+                      "torch_index": "cu118",
+                      "torch_version": "2.5.1",
+                      "torchvision_version": "0.20.1",
+                  }
               )
 
           matrix = json.dumps({"include": targets}, separators=(",", ":"))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"matrix={matrix}\n")
+          print(json.dumps({"include": targets}, indent=2))
           PY
 
   build:
@@ -113,10 +137,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -125,20 +149,25 @@ jobs:
 
       - name: Install PyTorch for macOS
         if: matrix.torch_index == 'macos'
-        run: python -m pip install torch==2.5.1 torchvision==0.20.1
+        run: >-
+          python -m pip install
+          torch==${{ matrix.torch_version }}
+          torchvision==${{ matrix.torchvision_version }}
 
       - name: Install CPU-only PyTorch
         if: matrix.torch_index == 'cpu'
         run: >-
           python -m pip install
-          torch==2.5.1 torchvision==0.20.1
+          torch==${{ matrix.torch_version }}
+          torchvision==${{ matrix.torchvision_version }}
           --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install CUDA-enabled PyTorch
         if: matrix.torch_index == 'cu118'
         run: >-
           python -m pip install
-          torch==2.5.1 torchvision==0.20.1
+          torch==${{ matrix.torch_version }}
+          torchvision==${{ matrix.torchvision_version }}
           --index-url https://download.pytorch.org/whl/cu118
 
       - name: Install application and build dependencies
@@ -152,8 +181,10 @@ jobs:
           import openslide
           import pyvips
           import torch
+          import torchvision
           print("DeeperHistReg:", deeperhistreg.__file__)
           print("PyTorch:", torch.__version__)
+          print("torchvision:", torchvision.__version__)
           print("Compiled CUDA:", torch.version.cuda)
           print("OpenSlide:", openslide.__version__)
           print("pyvips:", pyvips.__version__)
@@ -172,6 +203,13 @@ jobs:
           --platform-label ${{ matrix.platform_label }}
           --architecture ${{ matrix.architecture }}
 
+      - name: Ad-hoc sign macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          codesign --force --deep --sign - dist/HistRegGUI.app
+          codesign --verify --deep --strict --verbose=2 dist/HistRegGUI.app
+
       - name: Smoke-test packaged application
         run: python scripts/smoke_test_build.py
 
@@ -182,8 +220,18 @@ jobs:
           --architecture ${{ matrix.architecture }}
           --variant ${{ matrix.variant }}
 
+      - name: Report release size
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          for path in Path("release-assets").glob("*"):
+              size = path.stat().st_size / (1024 ** 3)
+              print(f"{path.name}: {size:.2f} GiB")
+          PY
+
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: HistRegGUI-${{ matrix.asset_platform }}-${{ matrix.architecture }}-${{ matrix.variant }}
           path: release-assets/*
@@ -199,13 +247,13 @@ jobs:
 
     steps:
       - name: Download all platform archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
 
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-assets/*
           generate_release_notes: true
