@@ -79,6 +79,16 @@ def main() -> None:
         raise RuntimeError(f"Packaged self-test reported failure: {payload}")
     if int(payload.get("preset_count", 0)) < 1:
         raise RuntimeError(f"No registration presets were packaged: {payload}")
+    if payload.get("pillow_tkinter_finder") != "ok":
+        raise RuntimeError(f"Pillow Tk bridge was not packaged: {payload}")
+    if payload.get("pillow_tkinter_finder_alias") != "ok":
+        raise RuntimeError(f"Pillow Tk compatibility alias was not packaged: {payload}")
+    if payload.get("batch_registration") != "ok":
+        raise RuntimeError(f"Batch registration support was not packaged: {payload}")
+    if payload.get("version") != "1.0":
+        raise RuntimeError(f"Unexpected packaged application version: {payload}")
+    if int(payload.get("supported_extension_count", 0)) < 10:
+        raise RuntimeError(f"Image-format support table is incomplete: {payload}")
 
     print(json.dumps(payload, indent=2))
     print(f"Packaged executable self-test passed: {executable}")

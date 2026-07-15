@@ -1,54 +1,130 @@
-# HistRegGUI
+# HistRegGUI v1.0
 
 Desktop GUI for histological image registration with **DeeperHistReg**.
 
-The application runs on **Windows, macOS and Linux**. CPU remains the default execution mode. Windows and Linux releases also provide an optional CUDA edition that can use a compatible NVIDIA GPU when the user explicitly enables it.
+HistRegGUI runs on Windows, Linux, macOS Intel, and macOS Apple Silicon. CPU is
+the default execution mode. Separate Windows and Linux CUDA packages can use a
+compatible NVIDIA GPU when CUDA is explicitly enabled inside the application.
 
 ![Hist Reg App Concept](assets/screenshots/DeeperHistReg_concept.png)
 
-## Downloads
+## Release downloads
 
-A normal version tag such as `v1.1.0` creates the four smaller CPU assets:
+A `v1.0` tag builds and publishes all six packages:
 
 - `HistRegGUI-Windows-x64-CPU.zip`
+- `HistRegGUI-Windows-x64-CUDA.zip`
 - `HistRegGUI-Linux-x64-CPU.tar.gz`
+- `HistRegGUI-Linux-x64-CUDA.tar.gz`
 - `HistRegGUI-macOS-Intel-x64-CPU.zip`
 - `HistRegGUI-macOS-Apple-Silicon-CPU.zip`
 
-CUDA packages for Windows and Linux are optional manual builds. A fully standalone CUDA package includes PyTorch and NVIDIA runtime libraries and is therefore approximately 2.7–3.1 GB. It still starts in CPU mode and only uses the GPU after the user enables CUDA.
+The CUDA archives are large because they include the CUDA-enabled PyTorch
+runtime and NVIDIA libraries. The manual workflow input still allows `none`,
+`windows`, `linux`, or `both`, with `both` selected by default.
 
 ## Quick start
 
-1. Select the **Target (Fixed)** image.
-2. Select the **Moving (Warp)** image.
-3. Choose a registration preset.
-4. Optionally keep intermediate results.
-5. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check reports CUDA as available.
-6. Click **Run registration**.
+1. Select the single **Target (Fixed)** image.
+2. Use **Add images...** to select one or several **Moving** images.
+3. Leave **Input reader** on **Auto (recommended)** or select a reader manually.
+4. Choose a registration preset.
+5. Optionally keep intermediate outputs.
+6. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
+7. Select **Run registration** or **Run registration batch**.
 
-The warped image is saved next to the fixed image as:
+With one moving image, the warped image is saved next to the fixed image as:
 
 ```text
 <moving>_warped_to_<fixed>.tif
 ```
 
+With several moving images, HistRegGUI processes them sequentially against the
+same fixed target and creates a timestamped folder:
+
+```text
+HistRegGUI_batch_<fixed>_<timestamp>/
+├── warped/
+│   ├── 001_<moving>_warped_to_<fixed>.tif
+│   └── 002_<moving>_warped_to_<fixed>.tif
+├── intermediate/                 # only retained when requested or after a failure
+├── registration_manifest.csv
+├── registration_manifest.json
+└── HistRegGUI_error.log          # only when an item fails
+```
+
+Batch processing is sequential by design so GPU and system memory are released
+between large registrations. A failed moving image is recorded and the remaining
+images continue processing.
+
 ![Hist Reg App Screenshot](assets/screenshots/DeeperHistReg.png)
+
+
+## One target, multiple moving images
+
+The moving-image table supports multi-file selection, duplicate prevention,
+removal/clearing, per-image reader display, queue/running/success/failure status,
+and click-to-preview. Automatic reader selection is resolved independently for
+each moving/fixed pair, so one batch may use different readers for TIFF, WSI,
+raster, or mixed-format inputs. The latest successful warped image is displayed
+in the result preview.
+
+Each run writes CSV and JSON manifests containing the source path, output path,
+reader, device, preset, timestamps, and error status for every moving image.
+
+## Supported inputs
+
+The file picker and preview system support:
+
+- TIFF and OME-TIFF: `.tif`, `.tiff`, `.ome.tif`, `.ome.tiff`
+- Whole-slide/pathology: `.svs`, `.ndpi`, `.mrxs`, `.scn`, `.vms`, `.vmu`, `.bif`, `.svslide`, `.dcm`
+- Standard raster: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`, `.jp2`, `.j2k`
+
+Automatic registration-reader selection uses:
+
+- **TIFF loader** for TIFF/OME-TIFF pairs
+- **OpenSlide loader** for whole-slide pairs
+- **Pillow loader** for ordinary raster pairs
+- **libvips loader** for mixed-format pairs
+
+The preview path is independent from registration and tries multiple backends:
+tifffile, OpenSlide, libvips, Pillow, and SimpleITK. OME-TIFF prefers tifffile
+so scientific axes and pyramid information are retained for preview selection.
+Large pyramidal images use reduced levels or sampled access rather than a full
+image decode whenever the backend permits it.
+
+A failed preview does not clear the chosen file. The user can still select a
+manual registration reader for troubleshooting.
+
+## Pillow/Tk packaging compatibility
+
+The PyInstaller build explicitly bundles:
+
+- `PIL.ImageTk`
+- `PIL._tkinter_finder`
+- `PIL._imagingtk`
+- `tkinter` and `_tkinter`
+- Pillow image plugins and binary components
+
+A compatibility alias also exposes `PIL.tkinter_finder` for older diagnostics
+that omit the underscore. Every platform job imports both names before building
+and repeats the check inside the packaged executable smoke test.
 
 ## CUDA behavior
 
-CPU is always the default. The application no longer globally disables CUDA or monkey-patches PyTorch.
+CPU remains the default. HistRegGUI does not hide CUDA or monkey-patch PyTorch.
 
 The **Hardware** menu provides:
 
-- **Check CUDA availability...**: checks the PyTorch build, NVIDIA driver and GPU, then performs a small CUDA allocation.
-- **Use CUDA acceleration when available**: enables `cuda:0` only after a successful check.
-- **Build information...**: shows whether the downloaded application is a CPU or CUDA build.
+- **Check CUDA availability...**
+- **Use CUDA acceleration when available**
+- **Build information...**
 
-When CUDA is not available, the checkbox is disabled and registration remains on CPU. DeeperHistReg's nested `device` and `cuda` parameters are normalized before each run so the chosen execution mode is applied consistently.
+The CUDA probe checks the PyTorch build, driver visibility, device names, and a
+small allocation. If the check fails, CUDA is disabled and registration remains
+on CPU. macOS builds are CPU-only.
 
-CUDA is not available on macOS. The application reports this normally and continues to work on CPU.
-
-## GitHub Actions builds
+## Build with GitHub Actions
 
 The workflow is located at:
 
@@ -56,30 +132,39 @@ The workflow is located at:
 .github/workflows/build-release.yml
 ```
 
-It can be started in two ways:
+For a test build:
 
-- **Actions → Build desktop releases → Run workflow** for test artifacts. The `cuda_target` selector defaults to `none` and can optionally build Windows CUDA, Linux CUDA, or both.
-- Push a version tag such as `v1.1.0` to build the four CPU applications and publish them in a GitHub Release.
+1. Open **Actions → Build desktop releases**.
+2. Select **Run workflow**.
+3. Leave `cuda_target` as `both` to generate all six packages.
 
-Example:
+For the v1.0 release:
 
 ```bash
+python scripts/validate_release_metadata.py --tag v1.0
 git add .
-git commit -m "Add multiplatform releases and optional CUDA"
-git tag v1.1.0
+git commit -m "Release HistRegGUI v1.0"
 git push origin main
-git push origin v1.1.0
+git tag v1.0
+git push origin v1.0
 ```
 
-CUDA is intentionally not built on ordinary tag pushes because each standalone CUDA archive is close to 3 GB. To attach CUDA to a release, open **Run workflow**, select the existing tag as the workflow ref, and choose `windows`, `linux`, or `both` under `cuda_target`.
+The tag run tests, packages, smoke-tests, and publishes all platform archives in
+a GitHub Release. macOS applications are ad-hoc signed and verified, but they
+are not notarized with an Apple Developer ID.
 
-Every job launches the packaged application in a non-GUI self-test mode before uploading it. macOS bundles are also ad-hoc signed and verified during the build. Intel macOS uses PyTorch 2.2.2 because newer official Intel wheels are no longer published.
+## Zenodo DOI
 
-## Why DeeperHistReg is installed during the build
+The repository includes:
 
-The previous Windows workflow attempted to bundle local `deeperhistreg/` and `external/` folders that were not tracked by Git. A clean GitHub runner therefore did not have the required content.
+- `CITATION.cff` for GitHub citation rendering and interoperable software metadata
+- `.zenodo.json` for Zenodo-specific release metadata
+- `ZENODO_RELEASE.md` with the one-time connection and release instructions
 
-The new build installs the published `deeperhistreg` package, locates its installed source and model files, and includes them automatically in the PyInstaller bundle. It also installs self-contained OpenSlide and libvips Python binary packages for portability.
+Before creating the first release, sign in to Zenodo with GitHub, synchronize
+repositories, and enable `Juaco2r/HistRegWSIGUI`. Once enabled, the GitHub
+Release created from tag `v1.0` is automatically ingested by Zenodo and receives
+a DOI. Repository files cannot perform that one-time account authorization.
 
 ## Local Windows CPU build
 
@@ -91,10 +176,6 @@ From PowerShell:
 
 The archive is created under `release-assets/`.
 
-## Supported inputs
-
-The picker accepts TIFF/TIF, JPG/JPEG, PNG and BMP. Previews are downsampled only for display and do not modify the registration input.
-
 ## Troubleshooting
 
 Registration failures are appended to:
@@ -103,14 +184,11 @@ Registration failures are appended to:
 HistRegGUI_error.log
 ```
 
-macOS applications are ad-hoc signed but are not notarized with an Apple Developer ID. On first launch, macOS may still require the usual **Open** confirmation from Finder or Privacy & Security.
-
-CUDA packages are considerably larger than CPU packages because they include the CUDA-enabled PyTorch runtime, cuDNN, cuBLAS, and related NVIDIA libraries. This is expected for a self-contained application; changing GitHub artifact compression does not meaningfully reduce these binary files. The workflow uses CUDA 11.8 for broad driver compatibility.
+The application records the chosen loader and whether CUDA was requested.
 
 ## Licensing
 
-- HistRegGUI wrapper: MIT License.
-- DeeperHistReg: see its upstream license and attribution requirements.
-- PyTorch, Pillow, OpenSlide, libvips and other components remain under their respective licenses.
+- HistRegGUI wrapper: MIT License
+- DeeperHistReg and bundled dependencies: their respective upstream licenses
 
 See `THIRD_PARTY_NOTICES.md`.

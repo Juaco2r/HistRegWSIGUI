@@ -16,6 +16,7 @@ HistRegGUI integrates third-party libraries and software components. Each compon
 ## Image backends
 
 - OpenSlide / openslide-bin — LGPL and bundled component licenses
+- tifffile and zarr — BSD-style licenses
 - pyvips / pyvips-binary / libvips — LGPL and related bundled component licenses
 
 Binary release folders include this notice and the project license. Consult the installed package metadata and upstream projects for complete license texts and source-offer obligations that may apply when redistributing native binaries.

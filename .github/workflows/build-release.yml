@@ -144,6 +144,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate v1.0 release metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: python scripts/validate_release_metadata.py --tag "$RELEASE_TAG"
+
       - name: Install compatible packaging tools
         # setuptools 82 removed pkg_resources. PyInstaller's pkg_resources
         # runtime hook still subclasses pkg_resources.NullProvider, so keep
@@ -195,28 +201,44 @@ jobs:
               )
           PY
 
-      - name: Verify runtime imports
+      - name: Verify runtime imports and Pillow Tk bridge
         shell: bash
+        env:
+          PYTHONPATH: src
         run: |
           python - <<'PY'
+          import sys
           import deeperhistreg
           import openslide
           import pyvips
+          import tifffile
+          import zarr
           import torch
           import torchvision
+          from histreggui.pillow_compat import install_pillow_tkinter_finder_alias
+
+          finder = install_pillow_tkinter_finder_alias()
+          from PIL import Image, ImageTk
+
+          assert finder.__name__ == "PIL._tkinter_finder"
+          assert sys.modules["PIL.tkinter_finder"] is finder
+          assert Image is not None and ImageTk is not None
           print("DeeperHistReg:", deeperhistreg.__file__)
           print("PyTorch:", torch.__version__)
           print("torchvision:", torchvision.__version__)
           print("Compiled CUDA:", torch.version.cuda)
           print("OpenSlide:", openslide.__version__)
           print("pyvips:", pyvips.__version__)
+          print("tifffile:", tifffile.__version__)
+          print("zarr:", zarr.__version__)
+          print("PIL._tkinter_finder and PIL.tkinter_finder alias: OK")
           PY
 
-      - name: Run hardware configuration tests
+      - name: Run application tests
         shell: bash
         env:
           PYTHONPATH: src
-        run: python -m pytest -q tests/test_hardware.py
+        run: python -m pytest -q tests
 
       - name: Build application
         run: >-

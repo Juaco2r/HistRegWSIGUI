@@ -1,0 +1,25 @@
+{
+  "creators": [
+    {
+      "name": "Rodriguez-Rojas, José",
+      "orcid": "0000-0003-4373-5480",
+      "affiliation": "University of Barcelona"
+    }
+  ],
+  "title": "HistRegGUI: Multiplatform Histological Image Registration with DeeperHistReg",
+  "version": "1.0",
+  "description": "HistRegGUI is a desktop interface for histological image registration with DeeperHistReg. It supports registering one or multiple moving images to the same fixed target, CPU and optional NVIDIA CUDA execution, automatic and manual image-reader selection, batch manifests, and packaged applications for Windows, Linux, macOS Intel, and macOS Apple Silicon.",
+  "access_right": "open",
+  "keywords": [
+    "digital pathology",
+    "histology",
+    "image registration",
+    "batch image registration",
+    "whole-slide imaging",
+    "DeeperHistReg",
+    "CUDA"
+  ],
+  "license": "mit",
+  "upload_type": "software",
+  "language": "eng"
+}

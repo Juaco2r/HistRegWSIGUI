@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import inspect
 import json
 import os
@@ -7,12 +8,25 @@ import shutil
 import sys
 import threading
 import traceback
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Allow this file to be executed directly from the source tree as well as
+# imported as a package or frozen by PyInstaller.
+_EARLY_SRC_ROOT = Path(__file__).resolve().parents[1]
+if not getattr(sys, "frozen", False) and str(_EARLY_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EARLY_SRC_ROOT))
+
+from histreggui import __version__
+from histreggui.pillow_compat import install_pillow_tkinter_finder_alias
+
+# Install the compatibility alias before importing ImageTk.  The packaged build
+# also includes a dedicated PyInstaller hook for the underlying private module.
+install_pillow_tkinter_finder_alias()
 from PIL import Image, ImageTk
 
 
@@ -51,11 +65,27 @@ if os.name == "nt" and hasattr(os, "add_dll_directory"):
 import torch  # noqa: E402
 import deeperhistreg  # noqa: E402
 
+from histreggui.batch import (  # noqa: E402
+    RegistrationBatchPlan,
+    RegistrationPlanItem,
+    build_registration_batch_plan,
+    unique_paths,
+    write_registration_manifest,
+)
 from histreggui.hardware import (  # noqa: E402
     CUDAInfo,
     configure_registration_device,
     detect_cuda,
     format_cuda_summary,
+)
+from histreggui.image_io import (  # noqa: E402
+    LOADER_CHOICES,
+    configure_registration_loader,
+    deeperhistreg_loader_class,
+    load_image_preview,
+    resolve_loader_choice,
+    supported_formats_text,
+    tkinter_image_filetypes,
 )
 
 
@@ -76,6 +106,7 @@ def load_build_info() -> dict[str, str]:
         except Exception:
             pass
     return {
+        "version": __version__,
         "variant": "unknown",
         "platform": sys.platform,
         "architecture": "unknown",
@@ -134,21 +165,16 @@ if not PRESETS:
     PRESETS = {"default initial nonrigid": deeperhistreg.configs.default_initial_nonrigid}
 
 
-def load_preview(path: Path, max_side: int = 600) -> Image.Image:
-    """Load a downsampled RGB preview without changing registration inputs."""
+def load_preview(path: Path, max_side: int = 600):
+    """Load a memory-conscious preview using TIFF, WSI, or raster backends."""
 
-    with Image.open(path) as source:
-        image = source.convert("RGB")
-    width, height = image.size
-    scale = max(width, height) / max_side if max(width, height) > max_side else 1.0
-    size = (max(1, int(width / scale)), max(1, int(height / scale)))
-    return image.resize(size)
+    return load_image_preview(path, max_side=max_side)
 
 
-def pick_loader_for_warp(_path: Path):
-    # The portable application intentionally uses PIL for the final warp.
-    return deeperhistreg.loaders.PILLoader
+def pick_loader_for_warp(loader_key: str):
+    """Use the same loader for registration and final full-resolution warp."""
 
+    return deeperhistreg_loader_class(deeperhistreg, loader_key)
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -157,18 +183,26 @@ def timestamp() -> str:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Histology Registration (DeeperHistReg)")
-        self.geometry("1240x820")
-        self.minsize(980, 650)
+        self.title(f"Histology Registration (DeeperHistReg) v{__version__}")
+        self.geometry("1280x900")
+        self.minsize(1040, 720)
 
         self.fixed_path: Path | None = None
-        self.moving_path: Path | None = None
+        self.moving_paths: list[Path] = []
+        self.current_moving_path: Path | None = None
+        self.moving_tree_paths: dict[str, Path] = {}
+        self.moving_tree_iids: dict[str, str] = {}
+        self.moving_statuses: dict[str, str] = {}
+        self.moving_readers: dict[str, str] = {}
 
         self.result_preview_imgtk: ImageTk.PhotoImage | None = None
         self.fixed_preview_imgtk: ImageTk.PhotoImage | None = None
         self.moving_preview_imgtk: ImageTk.PhotoImage | None = None
 
         self.preset_var = tk.StringVar(value=next(iter(PRESETS.keys())))
+        self.loader_var = tk.StringVar(value=next(iter(LOADER_CHOICES.keys())))
+        self.loader_status_var = tk.StringVar(value="Input reader: automatic")
+        self.moving_count_var = tk.StringVar(value="No moving images selected.")
         self.save_intermediate_var = tk.BooleanVar(value=False)
         self.use_cuda_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready.")
@@ -208,20 +242,55 @@ class App(tk.Tk):
         top.columnconfigure(2, weight=1)
 
         ttk.Label(top, text="Target (Fixed) image:").grid(row=0, column=0, sticky="w")
-        ttk.Button(top, text="Select...", command=self.select_fixed).grid(
-            row=0, column=1, padx=8, pady=3
-        )
+        self.fixed_button = ttk.Button(top, text="Select...", command=self.select_fixed)
+        self.fixed_button.grid(row=0, column=1, padx=8, pady=3, sticky="w")
         self.fixed_lbl = ttk.Label(top, text="(none)")
         self.fixed_lbl.grid(row=0, column=2, sticky="w")
 
-        ttk.Label(top, text="Moving (Warp) image:").grid(row=1, column=0, sticky="w")
-        ttk.Button(top, text="Select...", command=self.select_moving).grid(
-            row=1, column=1, padx=8, pady=3
+        ttk.Label(top, text="Moving images:").grid(row=1, column=0, sticky="nw", pady=(4, 0))
+        moving_buttons = ttk.Frame(top)
+        moving_buttons.grid(row=1, column=1, padx=8, pady=3, sticky="nw")
+        self.add_moving_button = ttk.Button(
+            moving_buttons, text="Add images...", command=self.add_moving_images
         )
-        self.moving_lbl = ttk.Label(top, text="(none)")
-        self.moving_lbl.grid(row=1, column=2, sticky="w")
+        self.add_moving_button.pack(side="left")
+        self.remove_moving_button = ttk.Button(
+            moving_buttons, text="Remove selected", command=self.remove_selected_moving
+        )
+        self.remove_moving_button.pack(side="left", padx=(6, 0))
+        self.clear_moving_button = ttk.Button(
+            moving_buttons, text="Clear", command=self.clear_moving_images
+        )
+        self.clear_moving_button.pack(side="left", padx=(6, 0))
+        ttk.Label(top, textvariable=self.moving_count_var).grid(
+            row=1, column=2, sticky="w", pady=(4, 0)
+        )
 
-        ttk.Label(top, text="Registration preset:").grid(row=2, column=0, sticky="w")
+        moving_frame = ttk.Frame(top)
+        moving_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(5, 8))
+        moving_frame.columnconfigure(0, weight=1)
+        self.moving_tree = ttk.Treeview(
+            moving_frame,
+            columns=("reader", "status"),
+            show="tree headings",
+            height=5,
+            selectmode="extended",
+        )
+        self.moving_tree.heading("#0", text="Moving image")
+        self.moving_tree.heading("reader", text="Reader")
+        self.moving_tree.heading("status", text="Status")
+        self.moving_tree.column("#0", width=650, minwidth=260, stretch=True)
+        self.moving_tree.column("reader", width=115, minwidth=90, stretch=False)
+        self.moving_tree.column("status", width=220, minwidth=140, stretch=True)
+        moving_scroll = ttk.Scrollbar(
+            moving_frame, orient="vertical", command=self.moving_tree.yview
+        )
+        self.moving_tree.configure(yscrollcommand=moving_scroll.set)
+        self.moving_tree.grid(row=0, column=0, sticky="nsew")
+        moving_scroll.grid(row=0, column=1, sticky="ns")
+        self.moving_tree.bind("<<TreeviewSelect>>", self._moving_selection_changed)
+
+        ttk.Label(top, text="Registration preset:").grid(row=3, column=0, sticky="w")
         preset = ttk.Combobox(
             top,
             textvariable=self.preset_var,
@@ -229,13 +298,27 @@ class App(tk.Tk):
             state="readonly",
             width=38,
         )
-        preset.grid(row=2, column=1, padx=8, pady=3, sticky="w")
+        preset.grid(row=3, column=1, padx=8, pady=3, sticky="w")
 
         ttk.Checkbutton(
             top,
             text="Save intermediate results",
             variable=self.save_intermediate_var,
-        ).grid(row=2, column=2, sticky="w")
+        ).grid(row=3, column=2, sticky="w")
+
+        ttk.Label(top, text="Input reader:").grid(row=4, column=0, sticky="w")
+        loader_combo = ttk.Combobox(
+            top,
+            textvariable=self.loader_var,
+            values=list(LOADER_CHOICES.keys()),
+            state="readonly",
+            width=38,
+        )
+        loader_combo.grid(row=4, column=1, padx=8, pady=3, sticky="w")
+        loader_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_loader_status())
+        ttk.Label(top, textvariable=self.loader_status_var).grid(
+            row=4, column=2, sticky="w", padx=(4, 0)
+        )
 
         self.cuda_check = ttk.Checkbutton(
             top,
@@ -243,14 +326,14 @@ class App(tk.Tk):
             variable=self.use_cuda_var,
             command=self._cuda_toggled,
         )
-        self.cuda_check.grid(row=3, column=1, padx=8, pady=(7, 3), sticky="w")
+        self.cuda_check.grid(row=5, column=1, padx=8, pady=(7, 3), sticky="w")
 
         ttk.Label(top, textvariable=self.cuda_status_var).grid(
-            row=3, column=2, sticky="w", padx=(4, 0)
+            row=5, column=2, sticky="w", padx=(4, 0)
         )
 
         self.run_button = ttk.Button(top, text="Run registration", command=self.run_clicked)
-        self.run_button.grid(row=4, column=1, pady=(10, 2), sticky="w")
+        self.run_button.grid(row=6, column=1, pady=(10, 2), sticky="w")
 
         previews = ttk.Frame(self, padding=10)
         previews.pack(fill="both", expand=True)
@@ -259,10 +342,14 @@ class App(tk.Tk):
             previews, text="Fixed preview", relief="groove", width=40, anchor="center"
         )
         self.moving_canvas = tk.Label(
-            previews, text="Moving preview", relief="groove", width=40, anchor="center"
+            previews,
+            text="Select a moving image in the list to preview it",
+            relief="groove",
+            width=40,
+            anchor="center",
         )
         self.result_canvas = tk.Label(
-            previews, text="Result preview", relief="groove", width=40, anchor="center"
+            previews, text="Latest result preview", relief="groove", width=40, anchor="center"
         )
 
         self.fixed_canvas.grid(row=0, column=0, padx=6, pady=6, sticky="nsew")
@@ -285,6 +372,17 @@ class App(tk.Tk):
 
     def _show_error(self, title: str, message: str) -> None:
         self._ui(messagebox.showerror, title, message)
+
+    def _set_running_controls(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for widget in (
+            self.fixed_button,
+            self.add_moving_button,
+            self.remove_moving_button,
+            self.clear_moving_button,
+            self.run_button,
+        ):
+            widget.config(state=state)
 
     # ------------------------------------------------------------ Hardware --
     def _update_cuda_controls(self) -> None:
@@ -328,56 +426,236 @@ class App(tk.Tk):
 
     def show_build_info(self) -> None:
         text = (
+            f"HistRegGUI version: {__version__}\n"
             f"Build variant: {BUILD_INFO.get('variant', 'unknown')}\n"
             f"Platform: {BUILD_INFO.get('platform', 'unknown')}\n"
             f"Architecture: {BUILD_INFO.get('architecture', 'unknown')}\n"
             f"PyTorch package: {BUILD_INFO.get('torch_variant', 'unknown')}\n"
             f"PyTorch version: {torch.__version__}\n"
-            f"CUDA status: {format_cuda_summary(self.cuda_info)}"
+            f"CUDA status: {format_cuda_summary(self.cuda_info)}\n"
+            f"Batch registration: one fixed target with multiple moving images\n"
+            f"Supported image extensions: {supported_formats_text()}"
         )
         messagebox.showinfo("Build information", text)
 
     # --------------------------------------------------------------- Inputs --
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        try:
+            return os.path.normcase(str(path.expanduser().resolve(strict=False)))
+        except Exception:
+            return os.path.normcase(str(path.expanduser().absolute()))
+
     def select_fixed(self) -> None:
         path = filedialog.askopenfilename(
             title="Select fixed (target) image",
-            filetypes=[
-                ("Images", "*.tif *.tiff *.jpg *.jpeg *.png *.bmp"),
-                ("All files", "*.*"),
-            ],
+            filetypes=tkinter_image_filetypes(),
         )
         if not path:
             return
         self.fixed_path = Path(path)
         self.fixed_lbl.config(text=str(self.fixed_path))
         self._update_preview(self.fixed_path, which="fixed")
+        self._update_loader_status()
 
-    def select_moving(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select moving (warp) image",
-            filetypes=[
-                ("Images", "*.tif *.tiff *.jpg *.jpeg *.png *.bmp"),
-                ("All files", "*.*"),
-            ],
+    def add_moving_images(self) -> None:
+        selected = filedialog.askopenfilenames(
+            title="Select one or more moving images",
+            filetypes=tkinter_image_filetypes(),
         )
-        if not path:
+        if not selected:
             return
-        self.moving_path = Path(path)
-        self.moving_lbl.config(text=str(self.moving_path))
-        self._update_preview(self.moving_path, which="moving")
+
+        previous = {self._path_key(path) for path in self.moving_paths}
+        self.moving_paths = unique_paths([*self.moving_paths, *selected])
+        added = [path for path in self.moving_paths if self._path_key(path) not in previous]
+        for path in added:
+            self.moving_statuses[self._path_key(path)] = "Pending"
+
+        preferred = added[0] if added else (self.moving_paths[0] if self.moving_paths else None)
+        self._refresh_moving_tree(select_path=preferred)
+        self._update_loader_status()
+        if preferred is not None:
+            self._select_moving_path(preferred, load_preview=True)
+
+    def remove_selected_moving(self) -> None:
+        selected_iids = self.moving_tree.selection()
+        if not selected_iids:
+            return
+        remove_keys = {
+            self._path_key(self.moving_tree_paths[iid])
+            for iid in selected_iids
+            if iid in self.moving_tree_paths
+        }
+        self.moving_paths = [
+            path for path in self.moving_paths if self._path_key(path) not in remove_keys
+        ]
+        for key in remove_keys:
+            self.moving_statuses.pop(key, None)
+            self.moving_readers.pop(key, None)
+
+        if self.current_moving_path and self._path_key(self.current_moving_path) in remove_keys:
+            self.current_moving_path = None
+            self.moving_preview_imgtk = None
+            self.moving_canvas.config(
+                image="", text="Select a moving image in the list to preview it"
+            )
+
+        preferred = self.moving_paths[0] if self.moving_paths else None
+        self._refresh_moving_tree(select_path=preferred)
+        self._update_loader_status()
+        if preferred is not None:
+            self._select_moving_path(preferred, load_preview=True)
+
+    def clear_moving_images(self) -> None:
+        self.moving_paths.clear()
+        self.current_moving_path = None
+        self.moving_statuses.clear()
+        self.moving_readers.clear()
+        self.moving_preview_imgtk = None
+        self.moving_canvas.config(
+            image="", text="Select a moving image in the list to preview it"
+        )
+        self.result_preview_imgtk = None
+        self.result_canvas.config(image="", text="Latest result preview")
+        self._refresh_moving_tree()
+        self._update_loader_status()
+
+    def _refresh_moving_tree(self, select_path: Path | None = None) -> None:
+        for iid in self.moving_tree.get_children():
+            self.moving_tree.delete(iid)
+        self.moving_tree_paths.clear()
+        self.moving_tree_iids.clear()
+
+        for index, path in enumerate(self.moving_paths, start=1):
+            key = self._path_key(path)
+            reader = self.moving_readers.get(key, self._reader_for_moving(path))
+            status = self.moving_statuses.get(key, "Pending")
+            iid = f"moving_{index}"
+            self.moving_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                text=str(path),
+                values=(reader, status),
+            )
+            self.moving_tree_paths[iid] = path
+            self.moving_tree_iids[key] = iid
+
+        count = len(self.moving_paths)
+        self.moving_count_var.set(
+            "No moving images selected."
+            if count == 0
+            else f"{count} moving image{'s' if count != 1 else ''} selected."
+        )
+        self.run_button.config(
+            text="Run registration" if count <= 1 else f"Run registration batch ({count})"
+        )
+
+        if select_path is not None:
+            iid = self.moving_tree_iids.get(self._path_key(select_path))
+            if iid:
+                self.moving_tree.selection_set(iid)
+                self.moving_tree.focus(iid)
+                self.moving_tree.see(iid)
+
+    def _moving_selection_changed(self, _event=None) -> None:
+        selection = self.moving_tree.selection()
+        if not selection:
+            return
+        path = self.moving_tree_paths.get(selection[0])
+        if path is not None and path != self.current_moving_path:
+            self._select_moving_path(path, load_preview=True)
+
+    def _select_moving_path(self, path: Path, *, load_preview: bool) -> None:
+        self.current_moving_path = path
+        iid = self.moving_tree_iids.get(self._path_key(path))
+        if iid:
+            self.moving_tree.selection_set(iid)
+            self.moving_tree.focus(iid)
+            self.moving_tree.see(iid)
+        if load_preview:
+            self._update_preview(path, which="moving")
 
     def _update_preview(self, path: Path, which: str) -> None:
         try:
-            image = load_preview(path, max_side=420)
+            image, preview_info = load_preview(path, max_side=420)
             image_tk = ImageTk.PhotoImage(image)
+            label_text = f"{path}  [{preview_info.summary()}]"
             if which == "fixed":
                 self.fixed_preview_imgtk = image_tk
                 self.fixed_canvas.config(image=image_tk, text="")
+                self.fixed_lbl.config(text=label_text)
             else:
                 self.moving_preview_imgtk = image_tk
                 self.moving_canvas.config(image=image_tk, text="")
+            self._update_loader_status()
         except Exception as exc:
-            messagebox.showerror("Preview error", str(exc))
+            # Preview decoding is independent from registration. Keep the file
+            # selected so the user can still try a manual loader.
+            self._update_loader_status()
+            messagebox.showwarning("Preview unavailable", f"{path}\n\n{exc}")
+
+    def _reader_for_moving(self, moving: Path) -> str:
+        if not self.fixed_path:
+            key = LOADER_CHOICES.get(self.loader_var.get(), self.loader_var.get())
+            return "automatic" if key == "auto" else key
+        try:
+            return resolve_loader_choice(self.loader_var.get(), moving, self.fixed_path)
+        except Exception:
+            return "error"
+
+    def _update_loader_status(self) -> None:
+        choice = self.loader_var.get()
+        key = LOADER_CHOICES.get(choice, choice)
+        if self.fixed_path and self.moving_paths:
+            readers: list[str] = []
+            errors: list[str] = []
+            for moving in self.moving_paths:
+                try:
+                    reader = resolve_loader_choice(choice, moving, self.fixed_path)
+                    readers.append(reader)
+                    self.moving_readers[self._path_key(moving)] = reader
+                except Exception as exc:
+                    errors.append(str(exc))
+                    self.moving_readers[self._path_key(moving)] = "error"
+
+            if errors:
+                self.loader_status_var.set(f"Input reader error: {errors[0]}")
+            elif key == "auto":
+                counts = Counter(readers)
+                summary = ", ".join(
+                    f"{reader} × {count}" for reader, count in sorted(counts.items())
+                )
+                self.loader_status_var.set(f"Input reader: auto → {summary}")
+            else:
+                self.loader_status_var.set(
+                    f"Input reader: {key} for {len(self.moving_paths)} image(s)"
+                )
+            self._refresh_moving_tree(select_path=self.current_moving_path)
+        else:
+            self.loader_status_var.set(
+                "Input reader: automatic" if key == "auto" else f"Input reader: {key}"
+            )
+            self._refresh_moving_tree(select_path=self.current_moving_path)
+
+    def _set_moving_status_ui(
+        self, path: Path, status: str, reader: str | None = None
+    ) -> None:
+        key = self._path_key(path)
+        self.moving_statuses[key] = status
+        if reader is not None:
+            self.moving_readers[key] = reader
+        iid = self.moving_tree_iids.get(key)
+        if iid and self.moving_tree.exists(iid):
+            current = self.moving_tree.item(iid, "values")
+            current_reader = reader or (current[0] if current else self._reader_for_moving(path))
+            self.moving_tree.item(iid, values=(current_reader, status))
+
+    def _set_moving_status(
+        self, path: Path, status: str, reader: str | None = None
+    ) -> None:
+        self._ui(self._set_moving_status_ui, path, status, reader)
 
     def _set_result_preview(self, image: Image.Image) -> None:
         image_tk = ImageTk.PhotoImage(image)
@@ -386,8 +664,11 @@ class App(tk.Tk):
 
     # --------------------------------------------------------- Registration --
     def run_clicked(self) -> None:
-        if not self.fixed_path or not self.moving_path:
-            messagebox.showwarning("Missing input", "Please select both fixed and moving images.")
+        if not self.fixed_path or not self.moving_paths:
+            messagebox.showwarning(
+                "Missing input",
+                "Please select one fixed image and at least one moving image.",
+            )
             return
 
         use_cuda = bool(self.use_cuda_var.get())
@@ -405,131 +686,301 @@ class App(tk.Tk):
                 use_cuda = False
 
         fixed = self.fixed_path
-        moving = self.moving_path
+        moving_paths = tuple(self.moving_paths)
         preset_key = self.preset_var.get()
         save_intermediate = bool(self.save_intermediate_var.get())
+        loader_choice = self.loader_var.get()
 
-        self.run_button.config(state="disabled")
+        try:
+            for moving in moving_paths:
+                resolve_loader_choice(loader_choice, moving, fixed)
+        except Exception as exc:
+            messagebox.showerror("Input reader error", str(exc))
+            return
+
+        self._set_running_controls(True)
+        for moving in moving_paths:
+            self._set_moving_status_ui(
+                moving,
+                "Queued",
+                resolve_loader_choice(loader_choice, moving, fixed),
+            )
+
         threading.Thread(
-            target=self._run_registration,
-            args=(fixed, moving, preset_key, save_intermediate, use_cuda),
+            target=self._run_registration_batch,
+            args=(
+                fixed,
+                moving_paths,
+                preset_key,
+                save_intermediate,
+                use_cuda,
+                loader_choice,
+            ),
             daemon=True,
         ).start()
 
-    def _run_registration(
+    def _append_error_log(
+        self,
+        plan: RegistrationBatchPlan,
+        item: RegistrationPlanItem,
+        use_cuda: bool,
+        loader_key: str,
+        trace: str,
+    ) -> None:
+        try:
+            plan.error_log.parent.mkdir(parents=True, exist_ok=True)
+            with plan.error_log.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + "=" * 80 + "\n")
+                handle.write(f"[ERROR] {datetime.now().isoformat()}\n")
+                handle.write(f"Fixed:  {plan.fixed_path}\n")
+                handle.write(f"Moving: {item.moving_path}\n")
+                handle.write(f"Output: {item.warped_output}\n")
+                handle.write(f"CUDA requested: {use_cuda}\n")
+                handle.write(f"Input reader: {loader_key}\n")
+                handle.write(trace)
+                handle.write("\n")
+        except Exception:
+            pass
+
+    def _run_registration_batch(
         self,
         fixed: Path,
-        moving: Path,
+        moving_paths: tuple[Path, ...],
         preset_key: str,
         save_intermediate: bool,
         use_cuda: bool,
+        loader_choice: str,
     ) -> None:
-        log_path: Path | None = None
+        plan: RegistrationBatchPlan | None = None
         try:
-            output_directory = fixed.parent
-            warped_output = output_directory / f"{moving.stem}_warped_to_{fixed.stem}.tif"
-            run_directory = output_directory / f"Run_{timestamp()}"
-            run_directory.mkdir(parents=True, exist_ok=True)
+            run_stamp = timestamp()
+            plan = build_registration_batch_plan(fixed, moving_paths, run_stamp)
+            if plan.batch_root is not None:
+                (plan.batch_root / "warped").mkdir(parents=True, exist_ok=True)
+                (plan.batch_root / "intermediate").mkdir(parents=True, exist_ok=True)
 
             preset_function = PRESETS[preset_key]
             function_name = getattr(preset_function, "__name__", preset_key)
             device = "cuda:0" if use_cuda else "cpu"
+            total = len(plan.items)
+            results: list[dict[str, object]] = []
+            successful_outputs: list[Path] = []
+            failures: list[tuple[Path, str]] = []
 
-            self._set_status(f"Preparing parameters: {function_name} ...")
-            parameters = configure_registration_device(preset_function(), device)  # type: ignore[operator]
-            loader = pick_loader_for_warp(moving)
-
-            if use_cuda:
-                gpu_name = self.cuda_info.device_names[0]
-                self._set_status(f"Running registration on CUDA: {gpu_name} ...")
-            else:
-                self._set_status("Running registration on CPU ...")
-
-            registration = deeperhistreg.direct_registration.DeeperHistReg_FullResolution(
-                registration_parameters=parameters
-            )
-            registration.run_registration(str(moving), str(fixed), str(run_directory))
-
-            self._set_status("Finding displacement field ...")
-            displacement_candidates = (
-                list(run_directory.rglob("displacement_field.mha"))
-                + list(run_directory.rglob("*disp*.mha"))
-                + list(run_directory.rglob("*.mha"))
-            )
-            if not displacement_candidates:
-                raise FileNotFoundError(
-                    f"No displacement field was found under: {run_directory}"
+            for item in plan.items:
+                started_at = datetime.now().isoformat()
+                loader_key = resolve_loader_choice(
+                    loader_choice, item.moving_path, fixed
                 )
-            displacement_field = next(
-                (
-                    path
-                    for path in displacement_candidates
-                    if path.name.lower() == "displacement_field.mha"
-                ),
-                displacement_candidates[0],
+                result: dict[str, object] = {
+                    "index": item.index,
+                    "status": "failed",
+                    "fixed_image": str(fixed),
+                    "moving_image": str(item.moving_path),
+                    "warped_output": str(item.warped_output),
+                    "intermediate_directory": str(item.run_directory),
+                    "loader": loader_key,
+                    "device": device,
+                    "preset": function_name,
+                    "started_at": started_at,
+                    "finished_at": "",
+                    "error": "",
+                }
+
+                self._set_moving_status(
+                    item.moving_path,
+                    f"Running {item.index}/{total}",
+                    loader_key,
+                )
+                if use_cuda:
+                    gpu_name = self.cuda_info.device_names[0]
+                    self._set_status(
+                        f"[{item.index}/{total}] Registering {item.moving_path.name} "
+                        f"with {loader_key} on CUDA: {gpu_name} ..."
+                    )
+                else:
+                    self._set_status(
+                        f"[{item.index}/{total}] Registering {item.moving_path.name} "
+                        f"with {loader_key} on CPU ..."
+                    )
+
+                try:
+                    item.warped_output.parent.mkdir(parents=True, exist_ok=True)
+                    item.run_directory.mkdir(parents=True, exist_ok=True)
+
+                    parameters = configure_registration_device(
+                        preset_function(), device  # type: ignore[operator]
+                    )
+                    parameters = configure_registration_loader(parameters, loader_key)
+                    loader = pick_loader_for_warp(loader_key)
+
+                    registration = (
+                        deeperhistreg.direct_registration.DeeperHistReg_FullResolution(
+                            registration_parameters=parameters
+                        )
+                    )
+                    registration.run_registration(
+                        str(item.moving_path), str(fixed), str(item.run_directory)
+                    )
+
+                    self._set_status(
+                        f"[{item.index}/{total}] Finding displacement field for "
+                        f"{item.moving_path.name} ..."
+                    )
+                    displacement_candidates = (
+                        list(item.run_directory.rglob("displacement_field.mha"))
+                        + list(item.run_directory.rglob("*disp*.mha"))
+                        + list(item.run_directory.rglob("*.mha"))
+                    )
+                    if not displacement_candidates:
+                        raise FileNotFoundError(
+                            "No displacement field was found under: "
+                            f"{item.run_directory}"
+                        )
+                    displacement_field = next(
+                        (
+                            path
+                            for path in displacement_candidates
+                            if path.name.lower() == "displacement_field.mha"
+                        ),
+                        displacement_candidates[0],
+                    )
+
+                    self._set_status(
+                        f"[{item.index}/{total}] Warping and saving "
+                        f"{item.warped_output.name} ..."
+                    )
+                    deeperhistreg.apply_deformation(
+                        source_image_path=str(item.moving_path),
+                        target_image_path=str(fixed),
+                        warped_image_path=str(item.warped_output),
+                        displacement_field_path=str(displacement_field),
+                        loader=loader,
+                        saver=deeperhistreg.savers.TIFFSaver,
+                        save_params=deeperhistreg.savers.tiff_saver.default_params,
+                        level=0,
+                        pad_value=255,
+                        save_source_only=True,
+                        to_template_shape=True,
+                        to_save_target_path=None,
+                    )
+
+                    try:
+                        result_image, _result_info = load_preview(
+                            item.warped_output, max_side=420
+                        )
+                        self._ui(self._set_result_preview, result_image)
+                    except Exception:
+                        pass
+
+                    if not save_intermediate:
+                        shutil.rmtree(item.run_directory, ignore_errors=True)
+
+                    result["status"] = "success"
+                    successful_outputs.append(item.warped_output)
+                    self._set_moving_status(
+                        item.moving_path, "Done", loader_key
+                    )
+
+                except Exception as exc:
+                    trace = traceback.format_exc()
+                    result["error"] = f"{exc!r}"
+                    failures.append((item.moving_path, str(exc)))
+                    self._append_error_log(
+                        plan, item, use_cuda, loader_key, trace
+                    )
+                    short_error = str(exc).strip() or type(exc).__name__
+                    if len(short_error) > 90:
+                        short_error = short_error[:87] + "..."
+                    self._set_moving_status(
+                        item.moving_path, f"Failed: {short_error}", loader_key
+                    )
+                finally:
+                    result["finished_at"] = datetime.now().isoformat()
+                    results.append(result)
+                    # Sequential processing is deliberate. Releasing tensors and
+                    # cached GPU blocks between images avoids batch-wide memory
+                    # growth, especially for large whole-slide registrations.
+                    gc.collect()
+                    if use_cuda:
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+            if plan.batch_root is not None and not save_intermediate:
+                intermediate_root = plan.batch_root / "intermediate"
+                try:
+                    if intermediate_root.exists() and not any(intermediate_root.iterdir()):
+                        intermediate_root.rmdir()
+                except Exception:
+                    pass
+
+            write_registration_manifest(plan, results)
+
+            success_count = len(successful_outputs)
+            failure_count = len(failures)
+            if plan.is_batch:
+                destination_text = f"Batch folder:\n{plan.batch_root}"
+            elif successful_outputs:
+                destination_text = f"Warped image:\n{successful_outputs[0]}"
+            else:
+                destination_text = f"Output folder:\n{fixed.parent}"
+
+            summary = (
+                f"Completed {len(plan.items)} registration(s).\n\n"
+                f"Successful: {success_count}\n"
+                f"Failed: {failure_count}\n\n"
+                f"{destination_text}\n\n"
+                f"CSV manifest:\n{plan.manifest_csv}\n"
+                f"JSON manifest:\n{plan.manifest_json}\n\n"
+                f"Execution device: {device}"
             )
+            if failures:
+                summary += f"\n\nError log:\n{plan.error_log}"
 
-            self._set_status("Warping moving image and saving TIFF ...")
-            deeperhistreg.apply_deformation(
-                source_image_path=str(moving),
-                target_image_path=str(fixed),
-                warped_image_path=str(warped_output),
-                displacement_field_path=str(displacement_field),
-                loader=loader,
-                saver=deeperhistreg.savers.TIFFSaver,
-                save_params=deeperhistreg.savers.tiff_saver.default_params,
-                level=0,
-                pad_value=255,
-                save_source_only=True,
-                to_template_shape=True,
-                to_save_target_path=None,
-            )
-
-            try:
-                result_image = load_preview(warped_output, max_side=420)
-                self._ui(self._set_result_preview, result_image)
-            except Exception:
-                pass
-
-            if not save_intermediate:
-                shutil.rmtree(run_directory, ignore_errors=True)
-
-            self._set_status(f"Done. Saved: {warped_output}")
-            self._ui(
-                messagebox.showinfo,
-                "Done",
-                f"Warped image saved:\n{warped_output}\n\nExecution device: {device}",
-            )
+            if failure_count == 0:
+                self._set_status(
+                    f"Done. {success_count} registration(s) saved. Manifest: "
+                    f"{plan.manifest_csv}"
+                )
+                self._ui(messagebox.showinfo, "Registration complete", summary)
+            elif success_count > 0:
+                self._set_status(
+                    f"Completed with errors: {success_count} succeeded, "
+                    f"{failure_count} failed."
+                )
+                self._ui(
+                    messagebox.showwarning,
+                    "Batch completed with errors",
+                    summary,
+                )
+            else:
+                self._set_status("All registrations failed.")
+                self._ui(messagebox.showerror, "Registration failed", summary)
 
         except Exception as exc:
             trace = traceback.format_exc()
             self._set_status("Error.")
-
+            log_path = plan.error_log if plan is not None else fixed.parent / "HistRegGUI_error.log"
             try:
-                log_path = fixed.parent / "HistRegGUI_error.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write("\n" + "=" * 80 + "\n")
-                    handle.write(f"[ERROR] {datetime.now().isoformat()}\n")
-                    handle.write(f"Fixed:  {fixed}\n")
-                    handle.write(f"Moving: {moving}\n")
-                    handle.write(f"CUDA requested: {use_cuda}\n")
+                    handle.write(f"[BATCH ERROR] {datetime.now().isoformat()}\n")
                     handle.write(trace)
                     handle.write("\n")
             except Exception:
-                log_path = None
-
-            message = (
-                "An error occurred during registration.\n\n"
+                pass
+            self._show_error(
+                "Registration error",
+                "The registration batch could not be completed.\n\n"
                 f"Error: {exc!r}\n\n"
-                "Full traceback:\n"
-                f"{trace}"
+                f"Full traceback:\n{trace}\n\n"
+                f"Log saved to:\n{log_path}",
             )
-            if log_path:
-                message += f"\n\nLog saved to:\n{log_path}"
-            self._show_error("Registration error", message)
         finally:
-            self._ui(self.run_button.config, state="normal")
-
+            self._ui(self._set_running_controls, False)
 
 def _self_test_output_path(argv: list[str]) -> Path | None:
     """Return the optional path supplied after ``--self-test-output``."""
@@ -555,14 +1006,31 @@ def run_self_test(output_path: Path | None = None) -> None:
     if not PRESETS:
         raise RuntimeError("No DeeperHistReg registration presets were discovered.")
 
+    # Verify both the canonical private name and the compatibility alias used
+    # by older packaging diagnostics.
+    finder_module = install_pillow_tkinter_finder_alias()
+    if finder_module is None or "PIL.tkinter_finder" not in sys.modules:
+        raise RuntimeError("Pillow Tk finder compatibility alias was not installed.")
+
     info = detect_cuda(torch, probe=False)
+    batch_probe = build_registration_batch_plan(
+        Path("fixed.tif"), [Path("moving_a.tif"), Path("moving_b.svs")], "self_test"
+    )
+    if len(batch_probe.items) != 2 or not batch_probe.is_batch:
+        raise RuntimeError("Batch registration planning is unavailable.")
+
     payload = {
         "status": "ok",
+        "version": __version__,
         "preset_count": len(PRESETS),
         "build": BUILD_INFO,
         "torch_version": str(torch.__version__),
         "cuda_compiled": info.compiled_with_cuda,
         "cuda_available": info.available,
+        "supported_extension_count": len(supported_formats_text().split(", ")),
+        "pillow_tkinter_finder": "ok",
+        "pillow_tkinter_finder_alias": "ok",
+        "batch_registration": "ok",
     }
     serialized = json.dumps(payload, indent=2)
 

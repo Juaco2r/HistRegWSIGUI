@@ -30,6 +30,14 @@ def package_exists(name: str) -> bool:
         return False
 
 
+def read_application_version() -> str:
+    namespace: dict[str, object] = {}
+    version_file = REPOSITORY_ROOT / "src" / "histreggui" / "__init__.py"
+    exec(version_file.read_text(encoding="utf-8"), namespace)
+    version = str(namespace.get("__version__", "")).strip()
+    if not version:
+        raise RuntimeError(f"Could not read __version__ from {version_file}")
+    return version
 
 
 def validate_pkg_resources_compatibility() -> None:
@@ -67,6 +75,7 @@ def main() -> None:
     build_info_path.write_text(
         json.dumps(
             {
+                "version": read_application_version(),
                 "variant": args.variant,
                 "platform": args.platform_label,
                 "architecture": args.architecture,
@@ -94,6 +103,8 @@ def main() -> None:
         "HistRegGUI",
         "--paths",
         str(REPOSITORY_ROOT / "src"),
+        "--additional-hooks-dir",
+        str(REPOSITORY_ROOT / "hooks"),
         "--distpath",
         str(dist_root),
         "--workpath",
@@ -114,6 +125,21 @@ def main() -> None:
         "deeperhistreg",
         "--copy-metadata",
         "deeperhistreg",
+        # Pillow imports image plugins and its Tk bridge dynamically.  Collect
+        # the package plus the canonical private finder and Tk extension so the
+        # frozen GUI supports the same raster formats as the source build.
+        "--collect-all",
+        "PIL",
+        "--hidden-import",
+        "PIL.ImageTk",
+        "--hidden-import",
+        "PIL._tkinter_finder",
+        "--hidden-import",
+        "PIL._imagingtk",
+        "--hidden-import",
+        "tkinter",
+        "--hidden-import",
+        "_tkinter",
     ]
 
     if sys.platform == "darwin":
@@ -123,6 +149,8 @@ def main() -> None:
 
     # These packages distribute native libraries/resources in wheels. Collecting
     # them explicitly makes the release portable on clean machines.
+    if package_exists("openslide"):
+        pyinstaller_args.extend(["--collect-all", "openslide"])
     if package_exists("openslide_bin"):
         pyinstaller_args.extend(["--collect-all", "openslide_bin"])
     if package_exists("_libvips"):
@@ -136,6 +164,8 @@ def main() -> None:
     for package_name in (
         "torchio",
         "SimpleITK",
+        "tifffile",
+        "zarr",
         "skimage",
         "sklearn",
         "cv2",
