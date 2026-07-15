@@ -24,10 +24,12 @@ HistRegGUI registers one or more moving histology images into the coordinate sys
 4. Review the moving-image table. Selecting a row displays that image in the moving preview.
 5. Keep **Input reader** on automatic or choose a reader manually.
 6. Choose a registration preset.
-7. Optionally enable **Save intermediate results**.
-8. Optionally open **Hardware → Check CUDA availability...**.
-9. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
-10. Click **Run registration** or **Run registration batch**.
+7. Use **Move up** and **Move down** to define the intended Z-slice order.
+8. Optionally enable **Save intermediate results**.
+9. Optionally enable **Create merged OME-TIFF stack after registration** and set fixed-target inclusion, downsample, XY pixel size, and Z spacing.
+10. Optionally open **Hardware → Check CUDA availability...**.
+11. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
+12. Click **Run registration** or **Run registration batch**.
 
 Accepted picker formats include TIFF/OME-TIFF, SVS, NDPI, MRXS, SCN, VMS, VMU, BIF, SVSLIDE, DICOM, JPG/JPEG, PNG, BMP, WebP, and JPEG 2000. Previews use tifffile, OpenSlide, libvips, Pillow, and SimpleITK fallbacks and are downsampled only for display.
 
@@ -70,6 +72,9 @@ HistRegGUI_batch_<fixed>_<timestamp>/
 │   ├── 001_<moving>_warped_to_<fixed>.tif
 │   └── 002_<moving>_warped_to_<fixed>.tif
 ├── intermediate/
+├── merged/
+│   ├── HistRegGUI_registered_stack_<fixed>.ome.tif
+│   └── HistRegGUI_registered_stack_<fixed>_stack.json
 ├── registration_manifest.csv
 ├── registration_manifest.json
 └── HistRegGUI_error.log
@@ -78,6 +83,12 @@ HistRegGUI_batch_<fixed>_<timestamp>/
 Numbered output filenames prevent collisions when moving images from different folders have the same basename.
 
 When intermediate saving is disabled, successful intermediate directories are removed. A failed item's intermediate directory is retained when available to support troubleshooting.
+
+### Optional merged volume
+
+When enabled, HistRegGUI writes a BigTIFF OME-TIFF with axes `ZYXS`. The fixed image can be included as the first slice, followed by successful warped images in the order displayed in the moving-image table. The writer streams 256 × 256 tiles and never constructs the full Z-stack in RAM. Deflate compression and BigTIFF are used for large-image compatibility.
+
+The merge downsample can be 1×, 2×, 4×, 8×, 16×, or 32×. XY calibration is automatically read when possible or entered manually; output XY pixel size is adjusted for downsampling. Z spacing must be provided in micrometres. A JSON sidecar records Z order and metadata.
 
 ## 7. Manifests and error handling
 

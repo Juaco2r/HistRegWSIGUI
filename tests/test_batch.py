@@ -6,6 +6,7 @@ from pathlib import Path
 
 from histreggui.batch import (
     build_registration_batch_plan,
+    default_merged_volume_path,
     safe_stem,
     unique_paths,
     write_registration_manifest,
@@ -66,3 +67,16 @@ def test_manifest_is_written_as_csv_and_json(tmp_path: Path) -> None:
     assert rows[0]["status"] == "success"
     assert payload["items"][0]["loader"] == "tiff"
     assert safe_stem("sample image #1") == "sample_image_1"
+
+
+def test_default_merged_volume_paths(tmp_path: Path) -> None:
+    fixed = tmp_path / "fixed image.tif"
+    one = build_registration_batch_plan(fixed, [tmp_path / "moving.tif"], "stamp")
+    assert default_merged_volume_path(one).name == "HistRegGUI_registered_stack_fixed_image_stamp.ome.tif"
+
+    batch = build_registration_batch_plan(
+        fixed, [tmp_path / "a.tif", tmp_path / "b.tif"], "stamp"
+    )
+    assert default_merged_volume_path(batch) == (
+        batch.batch_root / "merged" / "HistRegGUI_registered_stack_fixed_image.ome.tif"
+    )

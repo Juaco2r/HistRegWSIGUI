@@ -14,8 +14,9 @@ abstract: >-
   HistRegGUI is a desktop interface for histological image registration with
   DeeperHistReg. It registers one or multiple moving images to the same fixed
   target and provides CPU and optional NVIDIA CUDA execution, automatic and
-  manual image-reader selection, batch manifests, and packaged applications for
-  Windows, Linux, macOS Intel, and macOS Apple Silicon.
+  manual image-reader selection, batch manifests, optional memory-efficient
+  BigTIFF OME-TIFF stack creation for 3-D visualization, and packaged
+  applications for Windows, Linux, macOS Intel, and macOS Apple Silicon.
 keywords:
   - digital pathology
   - histology
@@ -24,5 +25,8 @@ keywords:
   - whole-slide imaging
   - DeeperHistReg
   - CUDA
+  - Imaris
+  - 3D reconstruction
+  - OME-TIFF
 repository-code: "https://github.com/Juaco2r/HistRegWSIGUI"
 url: "https://github.com/Juaco2r/HistRegWSIGUI"

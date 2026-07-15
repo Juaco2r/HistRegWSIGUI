@@ -29,9 +29,11 @@ runtime and NVIDIA libraries. The manual workflow input still allows `none`,
 2. Use **Add images...** to select one or several **Moving** images.
 3. Leave **Input reader** on **Auto (recommended)** or select a reader manually.
 4. Choose a registration preset.
-5. Optionally keep intermediate outputs.
-6. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
-7. Select **Run registration** or **Run registration batch**.
+5. Use **Move up** and **Move down** to place moving images in the intended Z order.
+6. Optionally keep intermediate outputs.
+7. Optionally enable **Create merged OME-TIFF stack after registration**. Configure whether the fixed target is the first Z slice, the output downsample, XY calibration, and Z spacing.
+8. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
+9. Select **Run registration** or **Run registration batch**.
 
 With one moving image, the warped image is saved next to the fixed image as:
 
@@ -48,9 +50,12 @@ HistRegGUI_batch_<fixed>_<timestamp>/
 │   ├── 001_<moving>_warped_to_<fixed>.tif
 │   └── 002_<moving>_warped_to_<fixed>.tif
 ├── intermediate/                 # only retained when requested or after a failure
+├── merged/                       # when merged-volume export is enabled
+│   ├── HistRegGUI_registered_stack_<fixed>.ome.tif
+│   └── HistRegGUI_registered_stack_<fixed>_stack.json
 ├── registration_manifest.csv
 ├── registration_manifest.json
-└── HistRegGUI_error.log          # only when an item fails
+└── HistRegGUI_error.log          # when registration or stack creation fails
 ```
 
 Batch processing is sequential by design so GPU and system memory are released
@@ -71,6 +76,22 @@ in the result preview.
 
 Each run writes CSV and JSON manifests containing the source path, output path,
 reader, device, preset, timestamps, and error status for every moving image.
+
+## Merged 3-D OME-TIFF output
+
+The optional merged-volume export creates a tiled, compressed **BigTIFF OME-TIFF** with axes `ZYXS` (Z, Y, X, RGB samples). This organization follows the successful stack pattern used in the accompanying research notebook, while replacing its all-in-memory `numpy.stack`/`tifffile.imread` approach with streaming output.
+
+The stack order is explicit:
+
+1. The fixed target is written as Z=0 when **Include fixed target as first Z slice** is enabled.
+2. Successful warped images follow in the order shown in the moving-image table.
+3. Failed registrations are omitted and recorded in the run manifest.
+
+The writer uses 256 × 256 tiles, Deflate compression, and BigTIFF. It opens one source at a time and yields one small tile at a time to `tifffile`; it does not create a complete in-memory volume. A partial file is removed if writing fails, and the completed file is structurally checked for BigTIFF, OME-XML, axes, and shape before it replaces the final path.
+
+For large WSI datasets, the default merge downsample is 4×. Available values are 1×, 2×, 4×, 8×, 16×, and 32×. XY pixel size is read from OME-TIFF, TIFF resolution tags, OpenSlide metadata, or libvips when possible; it can also be entered manually. Output XY calibration is multiplied by the selected downsample. Z spacing is user-editable and defaults to 4 µm.
+
+A JSON sidecar beside the OME-TIFF records every Z index, fixed/warped role, original source path, reader backend, physical calibration, output shape, tile size, compression, and downsample. The registration JSON manifest also records whether stack creation succeeded.
 
 ## Supported inputs
 

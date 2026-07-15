@@ -69,6 +69,7 @@ from histreggui.batch import (  # noqa: E402
     RegistrationBatchPlan,
     RegistrationPlanItem,
     build_registration_batch_plan,
+    default_merged_volume_path,
     unique_paths,
     write_registration_manifest,
 )
@@ -86,6 +87,11 @@ from histreggui.image_io import (  # noqa: E402
     resolve_loader_choice,
     supported_formats_text,
     tkinter_image_filetypes,
+)
+from histreggui.volume import (  # noqa: E402
+    VolumeSlice,
+    create_merged_ome_tiff,
+    infer_pixel_size_um,
 )
 
 
@@ -184,7 +190,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Histology Registration (DeeperHistReg) v{__version__}")
-        self.geometry("1280x900")
+        self.geometry("1280x980")
         self.minsize(1040, 720)
 
         self.fixed_path: Path | None = None
@@ -204,6 +210,14 @@ class App(tk.Tk):
         self.loader_status_var = tk.StringVar(value="Input reader: automatic")
         self.moving_count_var = tk.StringVar(value="No moving images selected.")
         self.save_intermediate_var = tk.BooleanVar(value=False)
+        self.create_merge_var = tk.BooleanVar(value=False)
+        self.merge_include_fixed_var = tk.BooleanVar(value=True)
+        self.merge_downsample_var = tk.StringVar(value="4")
+        self.merge_xy_um_var = tk.StringVar(value="")
+        self.merge_z_um_var = tk.StringVar(value="4.0")
+        self.merge_hint_var = tk.StringVar(
+            value="Streaming tiled BigTIFF OME-TIFF; at most one small image tile is held in memory."
+        )
         self.use_cuda_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready.")
         self.cuda_status_var = tk.StringVar(value="Checking hardware...")
@@ -215,6 +229,7 @@ class App(tk.Tk):
         self._build_menu()
         self._build_ui()
         self._update_cuda_controls()
+        self._toggle_merge_controls()
 
     # ------------------------------------------------------------------ UI --
     def _build_menu(self) -> None:
@@ -258,6 +273,14 @@ class App(tk.Tk):
             moving_buttons, text="Remove selected", command=self.remove_selected_moving
         )
         self.remove_moving_button.pack(side="left", padx=(6, 0))
+        self.move_up_button = ttk.Button(
+            moving_buttons, text="Move up", command=lambda: self.move_selected_moving(-1)
+        )
+        self.move_up_button.pack(side="left", padx=(6, 0))
+        self.move_down_button = ttk.Button(
+            moving_buttons, text="Move down", command=lambda: self.move_selected_moving(1)
+        )
+        self.move_down_button.pack(side="left", padx=(6, 0))
         self.clear_moving_button = ttk.Button(
             moving_buttons, text="Clear", command=self.clear_moving_images
         )
@@ -332,8 +355,52 @@ class App(tk.Tk):
             row=5, column=2, sticky="w", padx=(4, 0)
         )
 
+        merge_frame = ttk.LabelFrame(top, text="Optional merged volume", padding=8)
+        merge_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        merge_frame.columnconfigure(6, weight=1)
+        self.create_merge_check = ttk.Checkbutton(
+            merge_frame,
+            text="Create merged OME-TIFF stack after registration (Imaris-friendly)",
+            variable=self.create_merge_var,
+            command=self._toggle_merge_controls,
+        )
+        self.create_merge_check.grid(row=0, column=0, columnspan=7, sticky="w")
+
+        self.merge_include_fixed_check = ttk.Checkbutton(
+            merge_frame,
+            text="Include fixed target as first Z slice",
+            variable=self.merge_include_fixed_var,
+        )
+        self.merge_include_fixed_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+        ttk.Label(merge_frame, text="Downsample:").grid(row=1, column=2, sticky="e", padx=(12, 3), pady=(5, 0))
+        self.merge_downsample_combo = ttk.Combobox(
+            merge_frame,
+            textvariable=self.merge_downsample_var,
+            values=("1", "2", "4", "8", "16", "32"),
+            state="readonly",
+            width=5,
+        )
+        self.merge_downsample_combo.grid(row=1, column=3, sticky="w", pady=(5, 0))
+
+        ttk.Label(merge_frame, text="XY µm/px:").grid(row=1, column=4, sticky="e", padx=(12, 3), pady=(5, 0))
+        self.merge_xy_entry = ttk.Entry(merge_frame, textvariable=self.merge_xy_um_var, width=9)
+        self.merge_xy_entry.grid(row=1, column=5, sticky="w", pady=(5, 0))
+        self.merge_xy_entry.configure(validate="focusout")
+
+        ttk.Label(merge_frame, text="Z spacing µm:").grid(row=1, column=6, sticky="e", padx=(12, 3), pady=(5, 0))
+        self.merge_z_entry = ttk.Entry(merge_frame, textvariable=self.merge_z_um_var, width=9)
+        self.merge_z_entry.grid(row=1, column=7, sticky="w", pady=(5, 0))
+
+        ttk.Label(merge_frame, text="Leave XY empty to read calibration from the fixed image.").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(merge_frame, textvariable=self.merge_hint_var).grid(
+            row=2, column=4, columnspan=4, sticky="e", pady=(4, 0)
+        )
+
         self.run_button = ttk.Button(top, text="Run registration", command=self.run_clicked)
-        self.run_button.grid(row=6, column=1, pady=(10, 2), sticky="w")
+        self.run_button.grid(row=7, column=1, pady=(10, 2), sticky="w")
 
         previews = ttk.Frame(self, padding=10)
         previews.pack(fill="both", expand=True)
@@ -379,10 +446,31 @@ class App(tk.Tk):
             self.fixed_button,
             self.add_moving_button,
             self.remove_moving_button,
+            self.move_up_button,
+            self.move_down_button,
             self.clear_moving_button,
             self.run_button,
+            self.create_merge_check,
         ):
             widget.config(state=state)
+        if running:
+            for widget in (
+                self.merge_include_fixed_check,
+                self.merge_downsample_combo,
+                self.merge_xy_entry,
+                self.merge_z_entry,
+            ):
+                widget.config(state="disabled")
+        else:
+            self._toggle_merge_controls()
+
+    def _toggle_merge_controls(self) -> None:
+        enabled = bool(self.create_merge_var.get())
+        normal_state = "normal" if enabled else "disabled"
+        self.merge_include_fixed_check.config(state=normal_state)
+        self.merge_xy_entry.config(state=normal_state)
+        self.merge_z_entry.config(state=normal_state)
+        self.merge_downsample_combo.config(state="readonly" if enabled else "disabled")
 
     # ------------------------------------------------------------ Hardware --
     def _update_cuda_controls(self) -> None:
@@ -434,6 +522,7 @@ class App(tk.Tk):
             f"PyTorch version: {torch.__version__}\n"
             f"CUDA status: {format_cuda_summary(self.cuda_info)}\n"
             f"Batch registration: one fixed target with multiple moving images\n"
+            f"Merged volume: streamed tiled BigTIFF OME-TIFF (ZYXS)\n"
             f"Supported image extensions: {supported_formats_text()}"
         )
         messagebox.showinfo("Build information", text)
@@ -455,6 +544,15 @@ class App(tk.Tk):
             return
         self.fixed_path = Path(path)
         self.fixed_lbl.config(text=str(self.fixed_path))
+        if not self.merge_xy_um_var.get().strip():
+            calibration = infer_pixel_size_um(self.fixed_path)
+            if calibration is not None:
+                x_um, y_um = calibration
+                self.merge_xy_um_var.set(f"{(x_um + y_um) / 2.0:.6g}")
+                self.merge_hint_var.set(
+                    f"Fixed-image calibration detected: {x_um:.6g} × {y_um:.6g} µm/px. "
+                    "The merged output scales XY by the selected downsample."
+                )
         self._update_preview(self.fixed_path, which="fixed")
         self._update_loader_status()
 
@@ -506,6 +604,41 @@ class App(tk.Tk):
         self._update_loader_status()
         if preferred is not None:
             self._select_moving_path(preferred, load_preview=True)
+
+    def move_selected_moving(self, direction: int) -> None:
+        """Move selected slices while preserving their relative order."""
+
+        selected_iids = self.moving_tree.selection()
+        selected_paths = [
+            self.moving_tree_paths[iid]
+            for iid in selected_iids
+            if iid in self.moving_tree_paths
+        ]
+        if not selected_paths or direction not in (-1, 1):
+            return
+        selected_keys = {self._path_key(path) for path in selected_paths}
+        indices = [
+            index
+            for index, path in enumerate(self.moving_paths)
+            if self._path_key(path) in selected_keys
+        ]
+        iterator = indices if direction < 0 else list(reversed(indices))
+        for index in iterator:
+            neighbor = index + direction
+            if neighbor < 0 or neighbor >= len(self.moving_paths):
+                continue
+            if self._path_key(self.moving_paths[neighbor]) in selected_keys:
+                continue
+            self.moving_paths[index], self.moving_paths[neighbor] = (
+                self.moving_paths[neighbor],
+                self.moving_paths[index],
+            )
+        preferred = selected_paths[0]
+        self._refresh_moving_tree(select_path=preferred)
+        for path in selected_paths:
+            iid = self.moving_tree_iids.get(self._path_key(path))
+            if iid:
+                self.moving_tree.selection_add(iid)
 
     def clear_moving_images(self) -> None:
         self.moving_paths.clear()
@@ -690,12 +823,33 @@ class App(tk.Tk):
         preset_key = self.preset_var.get()
         save_intermediate = bool(self.save_intermediate_var.get())
         loader_choice = self.loader_var.get()
+        create_merge = bool(self.create_merge_var.get())
+        merge_include_fixed = bool(self.merge_include_fixed_var.get())
+        merge_downsample = 1
+        merge_xy_um: float | None = None
+        merge_z_um = 4.0
 
         try:
             for moving in moving_paths:
                 resolve_loader_choice(loader_choice, moving, fixed)
+            if create_merge:
+                merge_downsample = int(self.merge_downsample_var.get())
+                if merge_downsample < 1:
+                    raise ValueError("Merge downsample must be at least 1.")
+                xy_text = self.merge_xy_um_var.get().strip()
+                if xy_text:
+                    merge_xy_um = float(xy_text)
+                    if merge_xy_um <= 0:
+                        raise ValueError("XY pixel size must be greater than zero.")
+                else:
+                    calibration = infer_pixel_size_um(fixed)
+                    if calibration is not None:
+                        merge_xy_um = sum(calibration) / 2.0
+                merge_z_um = float(self.merge_z_um_var.get())
+                if merge_z_um <= 0:
+                    raise ValueError("Z spacing must be greater than zero.")
         except Exception as exc:
-            messagebox.showerror("Input reader error", str(exc))
+            messagebox.showerror("Input/settings error", str(exc))
             return
 
         self._set_running_controls(True)
@@ -715,6 +869,11 @@ class App(tk.Tk):
                 save_intermediate,
                 use_cuda,
                 loader_choice,
+                create_merge,
+                merge_include_fixed,
+                merge_downsample,
+                merge_xy_um,
+                merge_z_um,
             ),
             daemon=True,
         ).start()
@@ -750,6 +909,11 @@ class App(tk.Tk):
         save_intermediate: bool,
         use_cuda: bool,
         loader_choice: str,
+        create_merge: bool,
+        merge_include_fixed: bool,
+        merge_downsample: int,
+        merge_xy_um: float | None,
+        merge_z_um: float,
     ) -> None:
         plan: RegistrationBatchPlan | None = None
         try:
@@ -765,6 +929,7 @@ class App(tk.Tk):
             total = len(plan.items)
             results: list[dict[str, object]] = []
             successful_outputs: list[Path] = []
+            successful_slices: list[VolumeSlice] = []
             failures: list[tuple[Path, str]] = []
 
             for item in plan.items:
@@ -878,6 +1043,14 @@ class App(tk.Tk):
 
                     result["status"] = "success"
                     successful_outputs.append(item.warped_output)
+                    successful_slices.append(
+                        VolumeSlice(
+                            path=item.warped_output,
+                            role="warped",
+                            source_path=item.moving_path,
+                            label=f"{item.index:03d}_{item.moving_path.stem}",
+                        )
+                    )
                     self._set_moving_status(
                         item.moving_path, "Done", loader_key
                     )
@@ -916,7 +1089,61 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-            write_registration_manifest(plan, results)
+            merged_volume = None
+            merge_error = ""
+            if create_merge and successful_slices:
+                merge_slices: list[VolumeSlice] = []
+                if merge_include_fixed:
+                    merge_slices.append(
+                        VolumeSlice(
+                            path=fixed,
+                            role="fixed",
+                            source_path=fixed,
+                            label=f"000_fixed_{fixed.stem}",
+                        )
+                    )
+                merge_slices.extend(successful_slices)
+                merge_path = default_merged_volume_path(plan)
+                try:
+                    self._set_status(
+                        f"Creating merged OME-TIFF stack with {len(merge_slices)} slices ..."
+                    )
+                    merged_volume = create_merged_ome_tiff(
+                        merge_path,
+                        merge_slices,
+                        downsample=merge_downsample,
+                        voxel_xy_um=merge_xy_um,
+                        voxel_z_um=merge_z_um,
+                        tile_size=256,
+                        compression="deflate",
+                        progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                    )
+                except Exception as exc:
+                    merge_error = str(exc).strip() or type(exc).__name__
+                    try:
+                        plan.error_log.parent.mkdir(parents=True, exist_ok=True)
+                        with plan.error_log.open("a", encoding="utf-8") as handle:
+                            handle.write("\n" + "=" * 80 + "\n")
+                            handle.write(f"[MERGED VOLUME ERROR] {datetime.now().isoformat()}\n")
+                            handle.write(traceback.format_exc())
+                            handle.write("\n")
+                    except Exception:
+                        pass
+            elif create_merge:
+                merge_error = "No successful warped images were available for the merged stack."
+
+            run_summary: dict[str, object] = {
+                "registration_success_count": len(successful_outputs),
+                "registration_failure_count": len(failures),
+                "merged_volume_requested": create_merge,
+                "merged_volume": merged_volume.to_dict() if merged_volume is not None else None,
+                "merged_volume_error": merge_error,
+                "merged_volume_include_fixed": merge_include_fixed if create_merge else False,
+                "merged_volume_downsample": merge_downsample if create_merge else None,
+                "merged_volume_source_xy_um": merge_xy_um if create_merge else None,
+                "merged_volume_z_um": merge_z_um if create_merge else None,
+            }
+            write_registration_manifest(plan, results, run_summary=run_summary)
 
             success_count = len(successful_outputs)
             failure_count = len(failures)
@@ -936,23 +1163,39 @@ class App(tk.Tk):
                 f"JSON manifest:\n{plan.manifest_json}\n\n"
                 f"Execution device: {device}"
             )
-            if failures:
+            if merged_volume is not None:
+                summary += (
+                    f"\n\nMerged OME-TIFF stack:\n{merged_volume.path}"
+                    f"\nStack manifest:\n{merged_volume.sidecar_json}"
+                    f"\nShape: Z={merged_volume.z_slices}, Y={merged_volume.height}, "
+                    f"X={merged_volume.width}, RGB"
+                )
+            elif create_merge:
+                summary += f"\n\nMerged stack was not created: {merge_error}"
+            if failures or merge_error:
                 summary += f"\n\nError log:\n{plan.error_log}"
 
-            if failure_count == 0:
+            if failure_count == 0 and not merge_error:
                 self._set_status(
                     f"Done. {success_count} registration(s) saved. Manifest: "
                     f"{plan.manifest_csv}"
                 )
                 self._ui(messagebox.showinfo, "Registration complete", summary)
             elif success_count > 0:
-                self._set_status(
-                    f"Completed with errors: {success_count} succeeded, "
-                    f"{failure_count} failed."
-                )
+                if failure_count == 0 and merge_error:
+                    self._set_status(
+                        f"Registrations completed, but the merged stack failed: {merge_error}"
+                    )
+                    warning_title = "Registration complete; merge warning"
+                else:
+                    self._set_status(
+                        f"Completed with errors: {success_count} succeeded, "
+                        f"{failure_count} failed."
+                    )
+                    warning_title = "Batch completed with errors"
                 self._ui(
                     messagebox.showwarning,
-                    "Batch completed with errors",
+                    warning_title,
                     summary,
                 )
             else:
@@ -1018,6 +1261,9 @@ def run_self_test(output_path: Path | None = None) -> None:
     )
     if len(batch_probe.items) != 2 or not batch_probe.is_batch:
         raise RuntimeError("Batch registration planning is unavailable.")
+    merge_probe = default_merged_volume_path(batch_probe)
+    if not merge_probe.name.lower().endswith(".ome.tif"):
+        raise RuntimeError("Merged OME-TIFF output planning is unavailable.")
 
     payload = {
         "status": "ok",
@@ -1031,6 +1277,7 @@ def run_self_test(output_path: Path | None = None) -> None:
         "pillow_tkinter_finder": "ok",
         "pillow_tkinter_finder_alias": "ok",
         "batch_registration": "ok",
+        "streamed_merged_ome_tiff": "ok",
     }
     serialized = json.dumps(payload, indent=2)
 

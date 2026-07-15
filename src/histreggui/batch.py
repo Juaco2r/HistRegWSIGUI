@@ -141,9 +141,22 @@ def build_registration_batch_plan(
     )
 
 
+def default_merged_volume_path(plan: RegistrationBatchPlan) -> Path:
+    """Return a collision-safe OME-TIFF path for an optional merged stack."""
+
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    if plan.batch_root is not None:
+        return plan.batch_root / "merged" / f"HistRegGUI_registered_stack_{fixed_stem}.ome.tif"
+
+    manifest_stem = plan.manifest_csv.stem
+    stamp = manifest_stem.removeprefix("HistRegGUI_registration_")
+    return plan.fixed_path.parent / f"HistRegGUI_registered_stack_{fixed_stem}_{stamp}.ome.tif"
+
+
 def write_registration_manifest(
     plan: RegistrationBatchPlan,
     results: Sequence[dict[str, object]],
+    run_summary: dict[str, object] | None = None,
 ) -> None:
     """Write machine-readable CSV and JSON summaries for a completed run."""
 
@@ -174,6 +187,7 @@ def write_registration_manifest(
         "fixed_image": str(plan.fixed_path),
         "batch_root": str(plan.batch_root) if plan.batch_root else None,
         "items": rows,
+        "run_summary": dict(run_summary or {}),
     }
     plan.manifest_json.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",

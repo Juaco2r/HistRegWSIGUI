@@ -8,6 +8,11 @@
 - Per-image queue, reader, running, completion, and failure status in the moving-image table.
 - Sequential batch execution with GPU-memory cleanup between images and continuation after individual failures.
 - Collision-safe numbered batch outputs plus CSV and JSON registration manifests.
+- Optional merged, Imaris-friendly BigTIFF OME-TIFF volume after registration.
+- Streaming 256 × 256 tile writer that avoids loading the complete Z-stack or complete slides into RAM.
+- Fixed-target inclusion, editable Z spacing, automatic/editable XY calibration, and 1×–32× merge downsampling.
+- Moving-image Move up/Move down controls so Z-slice order is explicit before stack creation.
+- JSON sidecar recording Z order, source images, calibration, axes, downsample, compression, and reader backend.
 - GitHub Actions builds for four CPU packages and Windows/Linux CUDA packages.
 - Automatic GitHub Release publication for `v*` tags.
 - CPU-default execution with optional CUDA detection and explicit user activation.
