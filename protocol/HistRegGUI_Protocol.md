@@ -1,123 +1,82 @@
 # HistRegGUI Protocol
-Version: 1.0
-Author: Jose Rodriguez-Rojas  
-Last updated: 2026  
-License (wrapper): MIT  
-Registration engine: DeeperHistReg (CC BY-SA 4.0)
 
----
+Version: 1.1.0
 
-## 1. General Description
+Author: Jose Rodriguez-Rojas
 
-HistRegGUI is a desktop application designed to perform histological image registration using the **DeeperHistReg** engine.
+Last updated: 2026-07-15
 
-It allows the user to:
-- Select a **fixed (target)** image and a **moving (warp)** image
-- Choose a registration **preset** (rigid, nonrigid, initial, etc.)
-- Run registration on **CPU**
-- Save the **warped moving image aligned to the fixed image**
+## 1. Purpose
 
----
+HistRegGUI registers a moving histology image into the coordinate system of a fixed target image using DeeperHistReg. It provides a desktop interface for Windows, macOS and Linux.
 
-## 2. System Requirements
+## 2. Release editions
 
-- Operating system: Windows 10 or later
-- Architecture: 64-bit
-- CPU compatible with PyTorch (GPU not required)
-- Sufficient disk space for intermediate files and TIFF outputs
-- The Windows release is portable and includes required runtime components
+- **CPU**: default and recommended for maximum portability. No NVIDIA GPU is required.
+- **CUDA**: available for Windows and Linux. It contains a CUDA-enabled PyTorch runtime but still starts and runs in CPU mode unless the user explicitly enables CUDA.
+- **macOS Intel / Apple Silicon**: CPU execution. NVIDIA CUDA is not supported on macOS.
 
----
+## 3. Input procedure
 
-## 3. Supported Formats
+1. Open HistRegGUI.
+2. Select the **Target (Fixed)** image.
+3. Select the **Moving (Warp)** image.
+4. Choose a registration preset.
+5. Optionally enable **Save intermediate results**.
+6. Optionally open **Hardware → Check CUDA availability...**.
+7. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
+8. Click **Run registration**.
 
-The file picker accepts:
+Accepted picker formats are TIFF/TIF, JPG/JPEG, PNG and BMP. Previews are downsampled only for display.
 
-- TIFF (`.tif`, `.tiff`)
-- JPEG (`.jpg`, `.jpeg`)
-- PNG (`.png`)
-- BMP (`.bmp`)
+## 4. Hardware selection
 
-Previews shown in the GUI are downsampled for speed and do not affect registration.
+CPU is selected by default on every build.
 
----
+The CUDA check verifies:
 
-## 4. Usage Procedure
+- whether the bundled PyTorch runtime was compiled with CUDA;
+- whether a compatible NVIDIA driver and GPU are visible;
+- whether a small allocation on `cuda:0` succeeds.
 
-1. Run `HistRegGUI.exe`.
-2. Select the **Target (Fixed)** image using the corresponding **Select...** button.
-3. Select the **Moving (Warp)** image (the image to be deformed).
-4. Choose a **registration preset** from the dropdown menu.
-5. (Optional) Enable **Save intermediate results** to keep intermediate outputs.
-6. Click **Run registration** and wait for completion.
-7. Review the output image saved in the same folder as the fixed image.
+When CUDA is unavailable, the checkbox remains disabled. Before each registration, all nested DeeperHistReg `device` values and `cuda` flags are normalized to the selected mode.
 
----
+## 5. Output
 
-## 5. Registration Presets
+The final warped image is written next to the fixed image:
 
-Presets are detected dynamically from `deeperhistreg.configs`:
+```text
+<moving>_warped_to_<fixed>.tif
+```
 
-- Only callable config factories with **no arguments** that return a **dict** are included.
-- Presets are forced to run with `device="cpu"` even if the original config uses CUDA.
+When intermediate saving is enabled, the application retains:
 
-Common presets include (names may vary by DeeperHistReg version):
+```text
+Run_<timestamp>/
+```
 
-- **Initial + Nonrigid (default)**: initial alignment followed by non-rigid deformation
-- **Nonrigid**: non-rigid deformation only
-- **Rigid**: rigid transformation (rotation + translation)
-- **Initial**: initial alignment only
+Otherwise, that temporary folder is removed after a successful result.
 
----
+## 6. Error handling
 
-## 6. Outputs
+Failures are shown in a dialog and appended to:
 
-Generated artifacts include:
+```text
+HistRegGUI_error.log
+```
 
-- **Warped image (final output)**:  
-  `<moving>_warped_to_<fixed>.tif`
+The log records the fixed and moving paths, whether CUDA was requested, and the Python traceback.
 
-- **Temporary run folder** (if intermediate saving is enabled):  
-  `Run_<timestamp>`
+## 7. Validation
 
-- **Error log** (only if a failure occurs):  
-  `HistRegGUI_error.log`
+Registration results should be reviewed visually before quantitative analysis. Confirm that corresponding tissue structures, orientation and specimen region agree between fixed and warped images.
 
----
+## 8. Distribution
 
-## 7. Interpretation of Results
+GitHub Actions builds the application independently on Windows, Ubuntu and macOS runners. Version tags matching `v*` publish the generated archives in a GitHub Release.
 
-The saved output corresponds to the **moving image warped into the coordinate system of the fixed image**.
+The application is built with PyInstaller and includes the installed DeeperHistReg package, its resources, and binary image backends needed by the release.
 
-Recommended validation:
-- visually inspect alignment of key histological structures
-- verify orientation and content correspond to the same specimen/region
+## 9. Licensing
 
----
-
-## 8. Error Handling
-
-If an error occurs during registration:
-
-- A popup window will show error details.
-- A full traceback is written to `HistRegGUI_error.log` in the output folder.
-- Recommended checks:
-  - confirm both images are readable and not corrupted
-  - confirm images correspond to the same specimen / comparable region
-  - try a different preset (e.g., rigid only) to diagnose issues
-
----
-
-## 9. Technical Considerations
-
-- Registration is executed on **CPU only**.
-- CUDA is explicitly disabled to improve portability and avoid CUDA initialization failures.
-- Large images can require substantial RAM and time.
-- For best results, use images with comparable scale and orientation.
-
----
-
-## 10. Licensing Notes
-
-- HistRegGUI wrapper code is provided under the MIT License.
-- DeeperHistReg is licensed under **CC BY-SA 4.0**. If you redistribute DeeperHistReg (e.g., bundled in the release ZIP), you must comply with its license, including attribution and ShareAlike requirements where applicable.
+HistRegGUI wrapper code is distributed under the MIT License. DeeperHistReg and all bundled dependencies remain under their respective licenses. Review `THIRD_PARTY_NOTICES.md` before redistribution.

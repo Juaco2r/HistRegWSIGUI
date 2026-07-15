@@ -1,0 +1,6 @@
+{
+  "variant": "source",
+  "platform": "development",
+  "architecture": "native",
+  "torch_variant": "environment"
+}

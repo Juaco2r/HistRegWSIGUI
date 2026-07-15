@@ -1,21 +1,18 @@
 $ErrorActionPreference = "Stop"
+$env:PIP_NO_CACHE_DIR = "1"
 
-Write-Host "Cleaning previous builds..."
-Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
+Write-Host "Installing the CPU build dependencies..."
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-build.txt
 
-Write-Host "Building HistRegGUI (onedir mode)..."
+Write-Host "Running tests..."
+$env:PYTHONPATH = "src"
+python -m pytest -q tests/test_hardware.py
 
-pyinstaller `
-  --noconfirm `
-  --clean `
-  --windowed `
-  --name HistRegGUI `
-  --add-data "deeperhistreg;deeperhistreg" `
-  --add-data "external;external" `
-  src\histreggui\app.py
+Write-Host "Building HistRegGUI..."
+python scripts/build_app.py --variant cpu --platform-label windows --architecture x64
+python scripts/package_release.py --platform Windows --architecture x64 --variant cpu
 
 Write-Host ""
-Write-Host "Build complete!"
-Write-Host "Executable folder: dist\HistRegGUI\"
-Write-Host ""
-Write-Host "Zip the entire dist\HistRegGUI folder for GitHub Release."
+Write-Host "Build complete. Archive created under release-assets/."

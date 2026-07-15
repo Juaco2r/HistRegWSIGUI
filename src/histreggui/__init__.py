@@ -1,10 +1,5 @@
-"""
-HistRegGUI - GUI wrapper for DeeperHistReg (CPU-only).
+"""HistRegGUI: desktop wrapper for DeeperHistReg."""
 
-Author: Jose Rodriguez-Rojas
-License: MIT
-"""
-
-__version__ = "1.0"
+__version__ = "1.1.0"
 __author__ = "Jose Rodriguez-Rojas"
 __license__ = "MIT"
