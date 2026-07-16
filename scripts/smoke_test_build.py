@@ -89,6 +89,10 @@ def main() -> None:
         raise RuntimeError(f"Cascading registration support was not packaged: {payload}")
     if payload.get("streamed_registration_downsample") != "ok":
         raise RuntimeError(f"Registration downsample support was not packaged: {payload}")
+    if payload.get("if_he_registration_guides") != "ok":
+        raise RuntimeError(f"IF/H&E registration-guide support was not packaged: {payload}")
+    if payload.get("scientific_multichannel_zcyx") != "ok":
+        raise RuntimeError(f"Scientific multichannel merge support was not packaged: {payload}")
     if payload.get("version") != "1.0":
         raise RuntimeError(f"Unexpected packaged application version: {payload}")
     if int(payload.get("supported_extension_count", 0)) < 10:

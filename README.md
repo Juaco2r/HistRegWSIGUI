@@ -31,13 +31,14 @@ runtime and NVIDIA libraries. The manual workflow input still allows `none`,
    - **Independent**: every moving image is registered directly to the same fixed target.
    - **Cascading**: Slice 2 is warped to Slice 1, Slice 3 is warped to the already warped Slice 2, and this continues through the ordered series.
 4. Choose **Registration downsample** from 1× to 32×. Values above 1 create streamed tiled OME-TIFF working images and produce warped outputs at that reduced resolution.
-5. Leave **Input reader** on **Auto (recommended)** or select a reader manually. Downsampled working images use the TIFF reader automatically.
-6. Choose a registration preset.
-7. Use **Move up** and **Move down** to correct the consecutive Z order.
-8. Optionally retain intermediate/temporary working images.
-9. Optionally enable **Create merged OME-TIFF stack after registration**. Configure fixed-slice inclusion, additional merge downsample, original XY calibration, and Z spacing.
-10. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
-11. Start the independent batch or cascading registration.
+5. For IF or other scientific multichannel OME-TIFF files, leave **Preserve all IF channels** enabled. The registration guide defaults to DAPI/Hoechst when channel names are available; a channel number, maximum projection, or mean projection can also be selected.
+6. Leave **Input reader** on **Auto (recommended)** or select a reader manually. Downsampled or multichannel guide images use the TIFF reader automatically.
+7. Choose a registration preset.
+8. Use **Move up** and **Move down** to correct the consecutive Z order.
+9. Optionally retain intermediate/temporary working images.
+10. Optionally enable **Create merged OME-TIFF stack after registration**. Choose RGB display, scientific multichannel, or both; then configure fixed-slice inclusion, additional merge downsample, original XY calibration, and Z spacing.
+11. Optionally enable **Use CUDA acceleration (NVIDIA)** when the hardware check succeeds.
+12. Start the independent batch or cascading registration.
 
 There is no application-level slice-count limit. Registrations are performed one
 at a time and the final volume is written one tile at a time, so the practical
@@ -71,9 +72,12 @@ the previous warped output:
 HistRegGUI_cascade_<slice1>_<timestamp>/
 ├── reference/
 │   └── 000_fixed_<slice1>_regds4.ome.tif   # only when registration downsample > 1
-├── warped/
+├── warped/                              # RGB registration guides/results
 │   ├── 001_<slice2>_cascaded_to_000_<slice1>_regds4.tif
 │   ├── 002_<slice3>_cascaded_to_001_<slice2>_regds4.tif
+│   └── ...
+├── warped_scientific/                   # CYX OME-TIFF, all original channels
+│   ├── 001_<slice2>_cascaded_scientific_regds4.ome.tif
 │   └── ...
 ├── working/                               # retained only when requested
 ├── intermediate/                          # retained when requested or after failure
@@ -123,9 +127,23 @@ successful warped image is displayed in the result preview.
 Each run writes CSV and JSON manifests containing the source path, output path,
 reader, device, preset, timestamps, and error status for every moving image.
 
+
+## Registering four-channel IF with H&E
+
+HistRegGUI does not send a four-channel fluorescence array directly through the normal RGB registration path. Instead it separates alignment from scientific data preservation:
+
+1. An RGB `uint8` **registration guide** is created from each image. H&E keeps its RGB appearance. IF uses DAPI/Hoechst automatically when recognized, or the selected channel/composite. The optional inversion makes bright fluorescence nuclei dark on a white background, which can improve structural similarity to H&E.
+2. DeeperHistReg calculates one displacement field from the guide pair.
+3. That same field is applied to every original IF channel independently with zero-valued fluorescence background. Channel names, channel count, and integer dtype are retained in a `CYX` OME-TIFF. The warped file is calibrated on the fixed/target guide grid, so H&E and IF scanner pixel sizes are not incorrectly mixed.
+4. In a cascade, the previous **warped guide** is the next registration target, while the separate channel-preserving warped payload is retained for analysis and volume export.
+
+The expected IF input is a 2-D TIFF/OME-TIFF with axes such as `CYX` or `YXC`. The paired H&E image may be TIFF/OME-TIFF, a standard raster image, or a libvips-supported whole-slide format such as SVS, NDPI, MRXS, or SCN. For files containing additional Z or T dimensions, HistRegGUI consistently uses the first Z/T plane; a true 3-D or time-series registration should first be split into the intended 2-D sections.
+
+A mixed H&E/IF scientific merge uses OME-TIFF axes `ZCYX`. It creates a union channel schema such as `H&E Red`, `H&E Green`, `H&E Blue`, `DAPI`, `FITC`, `TRITC`, and `Cy5`. Channels absent from a particular Z section are zero-filled. If any IF source is `uint16`, RGB `uint8` values are expanded to `uint16` while fluorescence intensities are preserved. An optional RGB `ZYXS` guide stack can be written alongside it for rapid visual quality control.
+
 ## Merged 3-D OME-TIFF output
 
-The optional merged-volume export creates a tiled, compressed **BigTIFF OME-TIFF** with axes `ZYXS` (Z, Y, X, RGB samples). This organization follows the successful stack pattern used in the accompanying research notebook, while replacing its all-in-memory `numpy.stack`/`tifffile.imread` approach with streaming output.
+The optional merged-volume export can create an RGB guide stack with axes `ZYXS`, a channel-preserving scientific stack with axes `ZCYX`, or both. The RGB output is a tiled, compressed **BigTIFF OME-TIFF** (Z, Y, X, RGB samples). This organization follows the successful stack pattern used in the accompanying research notebook, while replacing its all-in-memory `numpy.stack`/`tifffile.imread` approach with streaming output.
 
 The stack order is explicit:
 

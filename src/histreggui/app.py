@@ -72,8 +72,13 @@ from histreggui.batch import (  # noqa: E402
     RegistrationBatchPlan,
     RegistrationPlanItem,
     build_registration_batch_plan,
+    default_fixed_guide_path,
+    default_fixed_scientific_path,
     default_merged_volume_path,
+    default_moving_guide_path,
     default_reference_image_path,
+    default_scientific_merged_volume_path,
+    default_scientific_warped_path,
     normalize_registration_mode,
     registration_target_for_step,
     unique_paths,
@@ -93,6 +98,24 @@ from histreggui.image_io import (  # noqa: E402
     resolve_loader_choice,
     supported_formats_text,
     tkinter_image_filetypes,
+)
+from histreggui.multichannel import (  # noqa: E402
+    GUIDE_MODES,
+    MERGE_MODE_AUTO,
+    MERGE_MODE_BOTH,
+    MERGE_MODE_DISPLAY,
+    MERGE_MODE_SCIENTIFIC,
+    MERGE_MODES,
+    GuideSettings,
+    ScientificImageResult,
+    create_merged_scientific_ome_tiff,
+    create_registration_guide_tiff,
+    create_scientific_payload_copy,
+    inspect_image_data,
+    normalize_guide_mode,
+    normalize_merge_mode,
+    series_requires_scientific_preservation,
+    warp_scientific_payload,
 )
 from histreggui.volume import (  # noqa: E402
     VolumeSlice,
@@ -223,7 +246,12 @@ class App(tk.Tk):
         self.loader_status_var = tk.StringVar(value="Input reader: automatic")
         self.moving_count_var = tk.StringVar(value="No moving images selected.")
         self.save_intermediate_var = tk.BooleanVar(value=False)
+        self.preserve_multichannel_var = tk.BooleanVar(value=True)
+        self.guide_mode_var = tk.StringVar(value=next(iter(GUIDE_MODES.keys())))
+        self.guide_channel_var = tk.StringVar(value="")
+        self.guide_invert_var = tk.BooleanVar(value=False)
         self.create_merge_var = tk.BooleanVar(value=False)
+        self.merge_mode_var = tk.StringVar(value=next(iter(MERGE_MODES.keys())))
         self.merge_include_fixed_var = tk.BooleanVar(value=True)
         self.merge_downsample_var = tk.StringVar(value="4")
         self.merge_xy_um_var = tk.StringVar(value="")
@@ -242,6 +270,7 @@ class App(tk.Tk):
         self._build_menu()
         self._build_ui()
         self._update_cuda_controls()
+        self._toggle_multichannel_controls()
         self._toggle_merge_controls()
         self._registration_mode_changed()
 
@@ -403,8 +432,47 @@ class App(tk.Tk):
             row=7, column=2, sticky="w", padx=(4, 0)
         )
 
+        multichannel_frame = ttk.LabelFrame(top, text="IF / multichannel registration", padding=8)
+        multichannel_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        self.preserve_multichannel_check = ttk.Checkbutton(
+            multichannel_frame,
+            text="Preserve all IF channels and original scientific dtype",
+            variable=self.preserve_multichannel_var,
+            command=self._toggle_multichannel_controls,
+        )
+        self.preserve_multichannel_check.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(multichannel_frame, text="Registration guide:").grid(row=0, column=2, sticky="e", padx=(15, 3))
+        self.guide_mode_combo = ttk.Combobox(
+            multichannel_frame,
+            textvariable=self.guide_mode_var,
+            values=list(GUIDE_MODES.keys()),
+            state="readonly",
+            width=43,
+        )
+        self.guide_mode_combo.grid(row=0, column=3, sticky="w")
+        self.guide_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._toggle_multichannel_controls())
+        ttk.Label(multichannel_frame, text="Channel #:").grid(row=0, column=4, sticky="e", padx=(12, 3))
+        self.guide_channel_entry = ttk.Entry(
+            multichannel_frame, textvariable=self.guide_channel_var, width=6
+        )
+        self.guide_channel_entry.grid(row=0, column=5, sticky="w")
+        self.guide_invert_check = ttk.Checkbutton(
+            multichannel_frame,
+            text="Invert IF guide (bright nuclei → dark; useful for H&E)",
+            variable=self.guide_invert_var,
+        )
+        self.guide_invert_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(
+            multichannel_frame,
+            text=(
+                "For IF↔H&E, registration is calculated from an RGB guide (Auto prefers DAPI/Hoechst), "
+                "then the same deformation is applied independently to every original IF channel."
+            ),
+            wraplength=1050,
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
         merge_frame = ttk.LabelFrame(top, text="Optional merged volume", padding=8)
-        merge_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        merge_frame.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 3))
         merge_frame.columnconfigure(6, weight=1)
         self.create_merge_check = ttk.Checkbutton(
             merge_frame,
@@ -412,7 +480,16 @@ class App(tk.Tk):
             variable=self.create_merge_var,
             command=self._toggle_merge_controls,
         )
-        self.create_merge_check.grid(row=0, column=0, columnspan=7, sticky="w")
+        self.create_merge_check.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(merge_frame, text="Merge content:").grid(row=0, column=3, sticky="e", padx=(12, 3))
+        self.merge_mode_combo = ttk.Combobox(
+            merge_frame,
+            textvariable=self.merge_mode_var,
+            values=list(MERGE_MODES.keys()),
+            state="readonly",
+            width=48,
+        )
+        self.merge_mode_combo.grid(row=0, column=4, columnspan=4, sticky="w")
 
         self.merge_include_fixed_check = ttk.Checkbutton(
             merge_frame,
@@ -448,7 +525,7 @@ class App(tk.Tk):
         )
 
         self.run_button = ttk.Button(top, text="Run registration", command=self.run_clicked)
-        self.run_button.grid(row=9, column=1, pady=(10, 2), sticky="w")
+        self.run_button.grid(row=10, column=1, pady=(10, 2), sticky="w")
 
         previews = ttk.Frame(self, padding=10)
         previews.pack(fill="both", expand=True)
@@ -500,6 +577,8 @@ class App(tk.Tk):
             self.run_button,
             self.create_merge_check,
             self.save_intermediate_check,
+            self.preserve_multichannel_check,
+            self.guide_invert_check,
         ):
             widget.config(state=state)
         if running:
@@ -507,21 +586,36 @@ class App(tk.Tk):
             self.registration_downsample_combo.config(state="disabled")
             self.preset_combo.config(state="disabled")
             self.loader_combo.config(state="disabled")
+            self.guide_mode_combo.config(state="disabled")
+            self.guide_channel_entry.config(state="disabled")
         else:
             self.registration_mode_combo.config(state="readonly")
             self.registration_downsample_combo.config(state="readonly")
             self.preset_combo.config(state="readonly")
             self.loader_combo.config(state="readonly")
+            self._toggle_multichannel_controls()
         if running:
             for widget in (
                 self.merge_include_fixed_check,
                 self.merge_downsample_combo,
                 self.merge_xy_entry,
                 self.merge_z_entry,
+                self.merge_mode_combo,
             ):
                 widget.config(state="disabled")
         else:
             self._toggle_merge_controls()
+
+    def _toggle_multichannel_controls(self) -> None:
+        enabled = bool(self.preserve_multichannel_var.get())
+        self.guide_mode_combo.config(state="readonly" if enabled else "disabled")
+        self.guide_invert_check.config(state="normal" if enabled else "disabled")
+        try:
+            selected_mode = normalize_guide_mode(self.guide_mode_var.get())
+        except Exception:
+            selected_mode = "auto"
+        channel_enabled = enabled and selected_mode == "channel"
+        self.guide_channel_entry.config(state="normal" if channel_enabled else "disabled")
 
     def _toggle_merge_controls(self) -> None:
         enabled = bool(self.create_merge_var.get())
@@ -530,6 +624,7 @@ class App(tk.Tk):
         self.merge_xy_entry.config(state=normal_state)
         self.merge_z_entry.config(state=normal_state)
         self.merge_downsample_combo.config(state="readonly" if enabled else "disabled")
+        self.merge_mode_combo.config(state="readonly" if enabled else "disabled")
 
     def _registration_mode_changed(self) -> None:
         mode = normalize_registration_mode(self.registration_mode_var.get())
@@ -611,7 +706,8 @@ class App(tk.Tk):
             f"CUDA status: {format_cuda_summary(self.cuda_info)}\n"
             f"Registration modes: independent one-target batch and cascading consecutive slices\n"
             f"Registration downsample: streamed OME-TIFF working images, 1×–32×\n"
-            f"Merged volume: streamed tiled BigTIFF OME-TIFF (ZYXS)\n"
+            f"Merged volumes: RGB ZYXS and channel-preserving scientific ZCYX OME-TIFF\n"
+            f"IF/H&E mode: RGB registration guide + deformation of every original IF channel\n"
             f"Supported image extensions: {supported_formats_text()}"
         )
         messagebox.showinfo("Build information", text)
@@ -964,17 +1060,57 @@ class App(tk.Tk):
         merge_downsample = 1
         merge_xy_um: float | None = None
         merge_z_um = 4.0
+        preserve_multichannel = bool(self.preserve_multichannel_var.get())
+        guide_settings = GuideSettings()
+        merge_mode = MERGE_MODE_AUTO
+        scientific_pipeline = False
 
         try:
             registration_downsample = int(self.registration_downsample_var.get())
             if registration_downsample < 1:
                 raise ValueError("Registration downsample must be at least 1.")
 
-            # At factor > 1 every source is converted to a streamed OME-TIFF
-            # working image and the registration reader is therefore TIFF. At
-            # factor 1, validate the actual pair logic, including the TIFF target
-            # created by every cascade step after the first.
-            if registration_downsample == 1:
+            guide_mode = normalize_guide_mode(self.guide_mode_var.get())
+            guide_channel_index = None
+            channel_text = self.guide_channel_var.get().strip()
+            if guide_mode == "channel":
+                if not channel_text:
+                    raise ValueError("Enter a 1-based IF channel number for the selected-channel guide.")
+                guide_channel_index = int(channel_text) - 1
+                if guide_channel_index < 0:
+                    raise ValueError("IF guide channel numbers start at 1.")
+            guide_settings = GuideSettings(
+                mode=guide_mode,
+                channel_index=guide_channel_index,
+                invert=bool(self.guide_invert_var.get()),
+            )
+            detected_scientific = series_requires_scientific_preservation((fixed, *moving_paths))
+            merge_mode = normalize_merge_mode(self.merge_mode_var.get()) if create_merge else MERGE_MODE_AUTO
+            if detected_scientific and not preserve_multichannel:
+                raise ValueError(
+                    "A multichannel IF input was detected. Enable 'Preserve all IF channels' "
+                    "so HistRegGUI can calculate registration from an RGB guide instead of "
+                    "sending a four-channel array through the standard RGB path."
+                )
+            scientific_pipeline = preserve_multichannel and detected_scientific
+            if scientific_pipeline and guide_settings.channel_index is not None:
+                for source in (fixed, *moving_paths):
+                    info = inspect_image_data(source)
+                    if not info.is_rgb and guide_settings.channel_index >= info.channel_count:
+                        raise ValueError(
+                            f"Guide channel {guide_settings.channel_index + 1} is unavailable in "
+                            f"{source.name}; it has {info.channel_count} channel(s)."
+                        )
+            if create_merge and merge_mode in {MERGE_MODE_SCIENTIFIC, MERGE_MODE_BOTH}:
+                if not preserve_multichannel:
+                    raise ValueError(
+                        "Scientific multichannel merge requires 'Preserve all IF channels' to be enabled."
+                    )
+                scientific_pipeline = True
+
+            # The multichannel pipeline always registers RGB TIFF guides. Standard
+            # images retain the original reader logic.
+            if registration_downsample == 1 and not scientific_pipeline:
                 for index, moving in enumerate(moving_paths):
                     target_hint = fixed
                     if registration_mode == REGISTRATION_MODE_CASCADE and index > 0:
@@ -1016,7 +1152,14 @@ class App(tk.Tk):
 
         self._set_running_controls(True)
         for moving in moving_paths:
-            display_reader = "tiff (working)" if registration_downsample > 1 else self._reader_for_moving(moving)
+            if scientific_pipeline:
+                display_reader = "tiff (RGB guide + scientific payload)"
+            else:
+                display_reader = (
+                    "tiff (working)"
+                    if registration_downsample > 1
+                    else self._reader_for_moving(moving)
+                )
             self._set_moving_status_ui(moving, "Queued", display_reader)
 
         threading.Thread(
@@ -1035,6 +1178,10 @@ class App(tk.Tk):
                 merge_downsample,
                 merge_xy_um,
                 merge_z_um,
+                preserve_multichannel,
+                guide_settings,
+                merge_mode,
+                scientific_pipeline,
             ),
             daemon=True,
         ).start()
@@ -1068,6 +1215,19 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _append_merge_error(
+        self, plan: RegistrationBatchPlan, label: str, trace: str
+    ) -> None:
+        try:
+            plan.error_log.parent.mkdir(parents=True, exist_ok=True)
+            with plan.error_log.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + "=" * 80 + "\n")
+                handle.write(f"[{label}] {datetime.now().isoformat()}\n")
+                handle.write(trace)
+                handle.write("\n")
+        except Exception:
+            pass
+
     def _run_registration_batch(
         self,
         fixed: Path,
@@ -1083,6 +1243,10 @@ class App(tk.Tk):
         merge_downsample: int,
         merge_xy_um: float | None,
         merge_z_um: float,
+        preserve_multichannel: bool,
+        guide_settings: GuideSettings,
+        merge_mode: str,
+        scientific_pipeline: bool,
     ) -> None:
         plan: RegistrationBatchPlan | None = None
         try:
@@ -1099,9 +1263,11 @@ class App(tk.Tk):
             if plan.batch_root is not None:
                 plan.output_directory.mkdir(parents=True, exist_ok=True)
                 plan.intermediate_directory.mkdir(parents=True, exist_ok=True)
-                if registration_downsample > 1:
+                if registration_downsample > 1 or scientific_pipeline:
                     plan.reference_directory.mkdir(parents=True, exist_ok=True)
                     plan.working_directory.mkdir(parents=True, exist_ok=True)
+                if scientific_pipeline:
+                    (plan.batch_root / "warped_scientific").mkdir(parents=True, exist_ok=True)
 
             preset_function = PRESETS[preset_key]
             function_name = getattr(preset_function, "__name__", preset_key)
@@ -1110,10 +1276,28 @@ class App(tk.Tk):
             results: list[dict[str, object]] = []
             successful_outputs: list[Path] = []
             successful_slices: list[VolumeSlice] = []
+            successful_scientific_slices: list[VolumeSlice] = []
+            scientific_image_results: list[ScientificImageResult] = []
             failures: list[tuple[Path, str]] = []
             skipped_count = 0
             cascade_stopped_after: int | None = None
-            fixed_work_result: WorkingImageResult | None = None
+            fixed_work_result: WorkingImageResult | ScientificImageResult | None = None
+            fixed_scientific_result: ScientificImageResult | None = None
+
+            scientific_merge_requested = bool(
+                create_merge
+                and (
+                    merge_mode in {MERGE_MODE_SCIENTIFIC, MERGE_MODE_BOTH}
+                    or (merge_mode == MERGE_MODE_AUTO and scientific_pipeline)
+                )
+            )
+            display_merge_requested = bool(
+                create_merge
+                and (
+                    merge_mode in {MERGE_MODE_DISPLAY, MERGE_MODE_BOTH}
+                    or merge_mode == MERGE_MODE_AUTO
+                )
+            )
 
             original_fixed_calibration = (
                 (float(merge_xy_um), float(merge_xy_um))
@@ -1121,7 +1305,37 @@ class App(tk.Tk):
                 else infer_pixel_size_um(fixed)
             )
             fixed_registration_path = fixed
-            if registration_downsample > 1:
+            fixed_scientific_path: Path | None = None
+            if scientific_pipeline:
+                plan.reference_directory.mkdir(parents=True, exist_ok=True)
+                plan.working_directory.mkdir(parents=True, exist_ok=True)
+                fixed_registration_path = default_fixed_guide_path(plan)
+                self._set_status(
+                    f"Preparing {registration_downsample}× RGB registration guide for first fixed slice ..."
+                )
+                fixed_work_result = create_registration_guide_tiff(
+                    fixed,
+                    fixed_registration_path,
+                    downsample=registration_downsample,
+                    settings=guide_settings,
+                    source_pixel_size_um=original_fixed_calibration,
+                    tile_size=256,
+                    compression="deflate",
+                    progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                )
+                if scientific_merge_requested and merge_include_fixed:
+                    fixed_scientific_path = default_fixed_scientific_path(plan)
+                    self._set_status("Preparing channel-preserving fixed slice for scientific merge ...")
+                    fixed_scientific_result = create_scientific_payload_copy(
+                        fixed,
+                        fixed_scientific_path,
+                        downsample=registration_downsample,
+                        source_pixel_size_um=original_fixed_calibration,
+                        tile_size=256,
+                        compression="deflate",
+                        progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                    )
+            elif registration_downsample > 1:
                 fixed_registration_path = default_reference_image_path(plan)
                 self._set_status(
                     f"Preparing {registration_downsample}× downsampled first fixed slice ..."
@@ -1140,14 +1354,23 @@ class App(tk.Tk):
 
             for position, item in enumerate(plan.items):
                 started_at = datetime.now().isoformat()
+                original_source_info = inspect_image_data(item.moving_path)
                 registration_source = item.moving_path
+                moving_guide_path = (
+                    default_moving_guide_path(plan, item) if scientific_pipeline else None
+                )
+                scientific_warped_path = (
+                    default_scientific_warped_path(plan, item) if scientific_pipeline else None
+                )
                 registration_target = registration_target_for_step(
                     registration_mode,
                     fixed_registration_path,
                     previous_warped_output,
                 )
-                loader_key = "tiff" if registration_downsample > 1 else resolve_loader_choice(
-                    loader_choice, registration_source, registration_target
+                loader_key = (
+                    "tiff"
+                    if scientific_pipeline or registration_downsample > 1
+                    else resolve_loader_choice(loader_choice, registration_source, registration_target)
                 )
                 result: dict[str, object] = {
                     "index": item.index,
@@ -1158,7 +1381,13 @@ class App(tk.Tk):
                     "moving_image": str(item.moving_path),
                     "registration_source": str(registration_source),
                     "registration_target": str(registration_target),
+                    "registration_guide_source": str(moving_guide_path or registration_source),
+                    "registration_guide_target": str(registration_target),
                     "warped_output": str(item.warped_output),
+                    "scientific_warped_output": str(scientific_warped_path or ""),
+                    "source_channel_count": original_source_info.channel_count,
+                    "source_channel_names": "; ".join(original_source_info.channel_names),
+                    "source_dtype": original_source_info.dtype,
                     "intermediate_directory": str(item.run_directory),
                     "loader": loader_key,
                     "device": device,
@@ -1172,14 +1401,38 @@ class App(tk.Tk):
                 self._set_moving_status(
                     item.moving_path,
                     f"Running {item.index}/{total}",
-                    f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
+                    f"{loader_key} (guide)" if scientific_pipeline else (
+                        f"{loader_key} (working)" if registration_downsample > 1 else loader_key
+                    ),
                 )
 
                 try:
                     item.warped_output.parent.mkdir(parents=True, exist_ok=True)
                     item.run_directory.mkdir(parents=True, exist_ok=True)
 
-                    if registration_downsample > 1:
+                    if scientific_pipeline:
+                        if moving_guide_path is None:
+                            raise RuntimeError("The multichannel registration guide path was not planned.")
+                        self._set_status(
+                            f"[{item.index}/{total}] Preparing RGB registration guide for "
+                            f"{item.moving_path.name} ..."
+                        )
+                        create_registration_guide_tiff(
+                            item.moving_path,
+                            moving_guide_path,
+                            downsample=registration_downsample,
+                            settings=guide_settings,
+                            source_pixel_size_um=infer_pixel_size_um(item.moving_path),
+                            tile_size=256,
+                            compression="deflate",
+                            progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                        )
+                        registration_source = moving_guide_path
+                        loader_key = "tiff"
+                        result["registration_source"] = str(registration_source)
+                        result["registration_guide_source"] = str(registration_source)
+                        result["loader"] = loader_key
+                    elif registration_downsample > 1:
                         if item.working_source is None:
                             raise RuntimeError("The downsampled working source path was not planned.")
                         self._set_status(
@@ -1198,6 +1451,7 @@ class App(tk.Tk):
                         registration_source = item.working_source
                         loader_key = "tiff"
                         result["registration_source"] = str(registration_source)
+                        result["registration_guide_source"] = str(registration_source)
                         result["loader"] = loader_key
 
                     registration_target = registration_target_for_step(
@@ -1206,7 +1460,8 @@ class App(tk.Tk):
                         previous_warped_output,
                     )
                     result["registration_target"] = str(registration_target)
-                    if registration_downsample == 1:
+                    result["registration_guide_target"] = str(registration_target)
+                    if registration_downsample == 1 and not scientific_pipeline:
                         loader_key = resolve_loader_choice(
                             loader_choice, registration_source, registration_target
                         )
@@ -1228,7 +1483,7 @@ class App(tk.Tk):
                         preset_function(), device  # type: ignore[operator]
                     )
                     parameters = configure_registration_loader(parameters, loader_key)
-                    if registration_downsample > 1 or registration_mode == REGISTRATION_MODE_CASCADE:
+                    if scientific_pipeline or registration_downsample > 1 or registration_mode == REGISTRATION_MODE_CASCADE:
                         loading_params = parameters.setdefault("loading_params", {})
                         if not isinstance(loading_params, dict):
                             raise TypeError("registration_parameters['loading_params'] must be a dictionary")
@@ -1289,6 +1544,59 @@ class App(tk.Tk):
                         to_save_target_path=None,
                     )
 
+                    scientific_result: ScientificImageResult | None = None
+                    if scientific_pipeline:
+                        if scientific_warped_path is None:
+                            raise RuntimeError("The channel-preserving warped output path was not planned.")
+                        scientific_warped_path.parent.mkdir(parents=True, exist_ok=True)
+                        self._set_status(
+                            f"[{item.index}/{total}] Applying the same deformation to all "
+                            f"{original_source_info.channel_count} source channel(s) ..."
+                        )
+                        registration_grid_pixel_size = None
+                        if (
+                            fixed_work_result is not None
+                            and fixed_work_result.pixel_size_x_um
+                            and fixed_work_result.pixel_size_y_um
+                        ):
+                            registration_grid_pixel_size = (
+                                float(fixed_work_result.pixel_size_x_um),
+                                float(fixed_work_result.pixel_size_y_um),
+                            )
+                        elif original_fixed_calibration is not None:
+                            registration_grid_pixel_size = (
+                                float(original_fixed_calibration[0]) * registration_downsample,
+                                float(original_fixed_calibration[1]) * registration_downsample,
+                            )
+
+                        scientific_result = warp_scientific_payload(
+                            item.moving_path,
+                            registration_source,
+                            registration_target,
+                            displacement_field,
+                            scientific_warped_path,
+                            source_pixel_size_um=infer_pixel_size_um(item.moving_path),
+                            target_pixel_size_um=registration_grid_pixel_size,
+                            downsample=registration_downsample,
+                            tile_size=256,
+                            compression="deflate",
+                            progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                        )
+                        result["scientific_warped_output"] = str(scientific_result.path)
+                        result["scientific_output_axes"] = scientific_result.axes
+                        result["scientific_output_dtype"] = scientific_result.dtype
+                        result["scientific_output_channel_count"] = scientific_result.channel_count
+                        result["scientific_output_channel_names"] = "; ".join(scientific_result.channel_names)
+                        scientific_image_results.append(scientific_result)
+                        successful_scientific_slices.append(
+                            VolumeSlice(
+                                path=scientific_result.path,
+                                role="he" if original_source_info.is_rgb else "if",
+                                source_path=item.moving_path,
+                                label=f"{item.index:03d}_{item.moving_path.stem}",
+                            )
+                        )
+
                     try:
                         result_image, _result_info = load_preview(
                             item.warped_output, max_side=420
@@ -1319,7 +1627,9 @@ class App(tk.Tk):
                     self._set_moving_status(
                         item.moving_path,
                         "Done",
-                        f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
+                        f"{loader_key} (guide)" if scientific_pipeline else (
+                            f"{loader_key} (working)" if registration_downsample > 1 else loader_key
+                        ),
                     )
 
                 except Exception as exc:
@@ -1342,7 +1652,9 @@ class App(tk.Tk):
                     self._set_moving_status(
                         item.moving_path,
                         f"Failed: {short_error}",
-                        f"{loader_key} (working)" if registration_downsample > 1 else loader_key,
+                        f"{loader_key} (guide)" if scientific_pipeline else (
+                            f"{loader_key} (working)" if registration_downsample > 1 else loader_key
+                        ),
                     )
                 finally:
                     result["finished_at"] = datetime.now().isoformat()
@@ -1350,6 +1662,11 @@ class App(tk.Tk):
                     if registration_downsample > 1 and item.working_source is not None and not save_intermediate:
                         try:
                             item.working_source.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    if scientific_pipeline and moving_guide_path is not None and not save_intermediate:
+                        try:
+                            moving_guide_path.unlink(missing_ok=True)
                         except Exception:
                             pass
                     # Sequential processing is deliberate. Releasing tensors and
@@ -1406,7 +1723,9 @@ class App(tk.Tk):
                         pass
 
             merged_volume = None
+            scientific_merged_volume = None
             merge_error = ""
+            scientific_merge_error = ""
             merge_source_xy_um = merge_xy_um
             if fixed_work_result is not None:
                 if fixed_work_result.pixel_size_x_um and fixed_work_result.pixel_size_y_um:
@@ -1418,7 +1737,7 @@ class App(tk.Tk):
                     if adjusted_calibration is not None:
                         merge_source_xy_um = sum(adjusted_calibration) / 2.0
 
-            if create_merge and successful_slices:
+            if display_merge_requested and successful_slices:
                 merge_slices: list[VolumeSlice] = []
                 if merge_include_fixed:
                     merge_slices.append(
@@ -1433,7 +1752,7 @@ class App(tk.Tk):
                 merge_path = default_merged_volume_path(plan)
                 try:
                     self._set_status(
-                        f"Creating merged OME-TIFF stack with {len(merge_slices)} slices ..."
+                        f"Creating RGB registration-guide stack with {len(merge_slices)} slices ..."
                     )
                     merged_volume = create_merged_ome_tiff(
                         merge_path,
@@ -1447,17 +1766,54 @@ class App(tk.Tk):
                     )
                 except Exception as exc:
                     merge_error = str(exc).strip() or type(exc).__name__
+                    self._append_merge_error(plan, "RGB DISPLAY MERGE", traceback.format_exc())
+            elif display_merge_requested:
+                merge_error = "No successful warped registration guides were available for the RGB stack."
+
+            if scientific_merge_requested and successful_scientific_slices:
+                scientific_slices: list[VolumeSlice] = []
+                if merge_include_fixed:
+                    if fixed_scientific_result is None or fixed_scientific_path is None:
+                        scientific_merge_error = (
+                            "The fixed channel-preserving payload could not be prepared."
+                        )
+                    else:
+                        fixed_info = inspect_image_data(fixed)
+                        scientific_slices.append(
+                            VolumeSlice(
+                                path=fixed_scientific_path,
+                                role="he" if fixed_info.is_rgb else "if",
+                                source_path=fixed,
+                                label=f"000_fixed_{fixed.stem}",
+                            )
+                        )
+                scientific_slices.extend(successful_scientific_slices)
+                if not scientific_merge_error:
+                    scientific_merge_path = default_scientific_merged_volume_path(plan)
                     try:
-                        plan.error_log.parent.mkdir(parents=True, exist_ok=True)
-                        with plan.error_log.open("a", encoding="utf-8") as handle:
-                            handle.write("\n" + "=" * 80 + "\n")
-                            handle.write(f"[MERGED VOLUME ERROR] {datetime.now().isoformat()}\n")
-                            handle.write(traceback.format_exc())
-                            handle.write("\n")
-                    except Exception:
-                        pass
-            elif create_merge:
-                merge_error = "No successful warped images were available for the merged stack."
+                        self._set_status(
+                            f"Creating channel-preserving ZCYX OME-TIFF with "
+                            f"{len(scientific_slices)} slices ..."
+                        )
+                        scientific_merged_volume = create_merged_scientific_ome_tiff(
+                            scientific_merge_path,
+                            scientific_slices,
+                            downsample=merge_downsample,
+                            voxel_xy_um=merge_source_xy_um,
+                            voxel_z_um=merge_z_um,
+                            tile_size=256,
+                            compression="deflate",
+                            progress_callback=lambda done, total_tiles, message: self._set_status(message),
+                        )
+                    except Exception as exc:
+                        scientific_merge_error = str(exc).strip() or type(exc).__name__
+                        self._append_merge_error(
+                            plan, "SCIENTIFIC MULTICHANNEL MERGE", traceback.format_exc()
+                        )
+            elif scientific_merge_requested:
+                scientific_merge_error = (
+                    "No successful channel-preserving warped images were available for the scientific stack."
+                )
 
             run_summary: dict[str, object] = {
                 "registration_mode": registration_mode,
@@ -1468,9 +1824,25 @@ class App(tk.Tk):
                 "registration_failure_count": len(failures),
                 "registration_skipped_dependency_count": skipped_count,
                 "cascade_stopped_after_step": cascade_stopped_after,
+                "preserve_multichannel_requested": preserve_multichannel,
+                "scientific_pipeline_enabled": scientific_pipeline,
+                "registration_guide_settings": {
+                    "mode": guide_settings.mode,
+                    "channel_index_zero_based": guide_settings.channel_index,
+                    "invert": guide_settings.invert,
+                },
+                "fixed_scientific_image": (
+                    fixed_scientific_result.to_dict() if fixed_scientific_result else None
+                ),
+                "scientific_warped_images": [item.to_dict() for item in scientific_image_results],
                 "merged_volume_requested": create_merge,
-                "merged_volume": merged_volume.to_dict() if merged_volume is not None else None,
-                "merged_volume_error": merge_error,
+                "merge_mode": merge_mode if create_merge else None,
+                "display_merged_volume": merged_volume.to_dict() if merged_volume is not None else None,
+                "display_merged_volume_error": merge_error,
+                "scientific_merged_volume": (
+                    scientific_merged_volume.to_dict() if scientific_merged_volume is not None else None
+                ),
+                "scientific_merged_volume_error": scientific_merge_error,
                 "merged_volume_include_fixed": merge_include_fixed if create_merge else False,
                 "merged_volume_additional_downsample": merge_downsample if create_merge else None,
                 "merged_volume_total_nominal_downsample": (
@@ -1508,7 +1880,13 @@ class App(tk.Tk):
                 f"Execution device: {device}"
             )
             if fixed_work_result is not None:
-                summary += f"\nDownsampled first/reference slice:\n{fixed_work_result.path}"
+                label = "Fixed RGB registration guide" if scientific_pipeline else "Downsampled first/reference slice"
+                summary += f"\n{label}:\n{fixed_work_result.path}"
+            if scientific_pipeline:
+                summary += (
+                    f"\nChannel-preserving warped images: {len(scientific_image_results)}"
+                    " (OME-TIFF CYX; original channel count/dtype retained)"
+                )
             if merged_volume is not None:
                 summary += (
                     f"\n\nMerged OME-TIFF stack:\n{merged_volume.path}"
@@ -1521,12 +1899,32 @@ class App(tk.Tk):
                         "\nThe merged stack contains only the successfully completed "
                         "cascade prefix before the failed step."
                     )
-            elif create_merge:
-                summary += f"\n\nMerged stack was not created: {merge_error}"
-            if failures or merge_error or skipped_count:
+            elif display_merge_requested:
+                summary += f"\n\nRGB display stack was not created: {merge_error}"
+            if scientific_merged_volume is not None:
+                summary += (
+                    f"\n\nScientific multichannel OME-TIFF stack:\n{scientific_merged_volume.path}"
+                    f"\nScientific stack manifest:\n{scientific_merged_volume.sidecar_json}"
+                    f"\nShape: Z={scientific_merged_volume.z_slices}, "
+                    f"C={scientific_merged_volume.channels}, Y={scientific_merged_volume.height}, "
+                    f"X={scientific_merged_volume.width}; dtype={scientific_merged_volume.dtype}"
+                    f"\nChannels: {', '.join(scientific_merged_volume.channel_names)}"
+                )
+                if cascade_stopped_after is not None:
+                    summary += (
+                        "\nThe scientific stack contains only the successfully completed "
+                        "cascade prefix before the failed step."
+                    )
+            elif scientific_merge_requested:
+                summary += (
+                    f"\n\nScientific multichannel stack was not created: "
+                    f"{scientific_merge_error}"
+                )
+            any_merge_error = bool(merge_error or scientific_merge_error)
+            if failures or any_merge_error or skipped_count:
                 summary += f"\n\nError log:\n{plan.error_log}"
 
-            if failure_count == 0 and skipped_count == 0 and not merge_error:
+            if failure_count == 0 and skipped_count == 0 and not any_merge_error:
                 self._set_status(
                     f"Done. {success_count} registration(s) saved. Manifest: "
                     f"{plan.manifest_csv}"
@@ -1618,6 +2016,14 @@ def run_self_test(output_path: Path | None = None) -> None:
     merge_probe = default_merged_volume_path(cascade_probe)
     if not merge_probe.name.lower().endswith(".ome.tif"):
         raise RuntimeError("Merged OME-TIFF output planning is unavailable.")
+    scientific_merge_probe = default_scientific_merged_volume_path(cascade_probe)
+    scientific_warp_probe = default_scientific_warped_path(
+        cascade_probe, cascade_probe.items[0]
+    )
+    if "scientific" not in scientific_merge_probe.name.lower():
+        raise RuntimeError("Scientific multichannel merge planning is unavailable.")
+    if scientific_warp_probe.suffixes[-2:] != [".ome", ".tif"]:
+        raise RuntimeError("Channel-preserving warped output planning is unavailable.")
     reference_probe = default_reference_image_path(cascade_probe)
     if not reference_probe.name.lower().endswith(".ome.tif"):
         raise RuntimeError("Downsampled reference-image planning is unavailable.")
@@ -1637,6 +2043,8 @@ def run_self_test(output_path: Path | None = None) -> None:
         "cascading_registration": "ok",
         "streamed_registration_downsample": "ok",
         "streamed_merged_ome_tiff": "ok",
+        "if_he_registration_guides": "ok",
+        "scientific_multichannel_zcyx": "ok",
     }
     serialized = json.dumps(payload, indent=2)
 

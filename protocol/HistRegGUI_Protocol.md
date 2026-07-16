@@ -4,7 +4,7 @@ Version: 1.0
 
 Author: Jose Rodriguez-Rojas
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 ## 1. Purpose
 
@@ -31,8 +31,9 @@ The application also provides optional streamed registration downsampling and me
 6. Choose **Registration downsample**: 1×, 2×, 4×, 8×, 16×, or 32×.
 7. Keep **Input reader** on automatic or choose a reader manually. Registration downsample values above 1 create TIFF working images and therefore use the TIFF reader.
 8. Choose a registration preset.
-9. Optionally enable **Save intermediate and temporary working images**.
-10. Optionally enable **Create merged OME-TIFF stack after registration** and set first-slice inclusion, additional merge downsample, original XY pixel size, and Z spacing.
+9. For IF/OME-TIFF, keep **Preserve all IF channels** enabled and select the registration guide. Auto prefers a channel named DAPI, Hoechst, nuclei, or nuclear.
+10. Optionally enable **Save intermediate and temporary working images**.
+11. Optionally enable **Create merged OME-TIFF stack after registration**, choose RGB display, scientific multichannel, or both, and set first-slice inclusion, additional merge downsample, original XY pixel size, and Z spacing.
 11. Optionally open **Hardware → Check CUDA availability...**.
 12. Enable **Use CUDA acceleration (NVIDIA)** only when the check succeeds.
 13. Start the registration.
@@ -69,6 +70,16 @@ For factors above 1, HistRegGUI creates tiled OME-BigTIFF working images by stre
 - Warped outputs are produced at the selected reduced resolution; this is not a full-resolution warp.
 - Physical X/Y calibration is scaled using the actual output dimensions, including odd-size rounding.
 
+
+### 4.4 Multichannel IF and H&E
+
+- Each selected file represents one 2-D section. Multichannel IF should be TIFF/OME-TIFF `CYX` or `YXC`; H&E may also be a libvips-supported whole-slide format such as SVS, NDPI, MRXS, or SCN. The first plane is used for additional Z/T dimensions.
+- H&E is converted to an RGB guide. IF is converted to an RGB guide from DAPI/Hoechst, a selected channel, a maximum composite, or a mean composite. Optional guide inversion maps bright fluorescence nuclei to dark structures on a light background.
+- DeeperHistReg estimates the displacement field from the RGB guide pair.
+- The field is then applied to all original source channels with zero fluorescence padding. The scientific warped output is OME-TIFF `CYX`, retains channel names, channel count, and dtype, and adopts the fixed/target registration-grid calibration.
+- In cascading mode, the previous warped RGB guide is the next target. Scientific payloads remain separate and do not lose channels as the cascade proceeds.
+- The scientific merged output uses `ZCYX`. H&E RGB and IF marker channels form a union schema; missing channels in each Z plane are written as zeros.
+
 ## 5. Hardware selection
 
 CPU is selected by default on every build.
@@ -95,7 +106,7 @@ Numbered filenames prevent collisions and preserve the requested section order.
 
 ### Optional merged volume
 
-HistRegGUI writes a tiled, Deflate-compressed BigTIFF OME-TIFF with axes `ZYXS`. The first fixed/reference image can be Z=0, followed by successful warped images in table order. The writer opens one image at a time and yields one 256 × 256 tile at a time; it never constructs the complete volume in RAM.
+HistRegGUI can write a tiled, Deflate-compressed RGB guide BigTIFF OME-TIFF with axes `ZYXS`, a channel-preserving scientific OME-TIFF with axes `ZCYX`, or both. The first fixed/reference image can be Z=0, followed by successful warped images in table order. The writer opens one image at a time and yields one 256 × 256 tile at a time; it never constructs the complete volume in RAM.
 
 The merge downsample is additional to the registration downsample. For example, a 4× registration downsample plus a 2× merge downsample gives a nominal total reduction of 8×. The retained downsampled reference stores the actual physical X/Y calibration, and Z spacing is supplied in micrometres.
 

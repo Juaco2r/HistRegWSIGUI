@@ -252,6 +252,68 @@ def default_reference_image_path(plan: RegistrationBatchPlan) -> Path:
     return plan.reference_directory / f"000_fixed_{fixed_stem}_regds{factor}.ome.tif"
 
 
+
+def default_fixed_guide_path(plan: RegistrationBatchPlan) -> Path:
+    """Return the RGB guide used as the fixed registration image."""
+
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    factor = int(plan.registration_downsample)
+    return plan.reference_directory / f"000_fixed_{fixed_stem}_guide_regds{factor}.ome.tif"
+
+
+def default_fixed_scientific_path(plan: RegistrationBatchPlan) -> Path:
+    """Return the channel-preserving fixed/reference payload path."""
+
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    factor = int(plan.registration_downsample)
+    return plan.reference_directory / f"000_fixed_{fixed_stem}_scientific_regds{factor}.ome.tif"
+
+
+def default_moving_guide_path(plan: RegistrationBatchPlan, item: RegistrationPlanItem) -> Path:
+    """Return a transient RGB registration guide for one moving image."""
+
+    source_stem = safe_stem(item.moving_path.stem, "moving")
+    factor = int(plan.registration_downsample)
+    return plan.working_directory / f"{item.index:03d}_{source_stem}_guide_regds{factor}.ome.tif"
+
+
+def default_scientific_warped_path(
+    plan: RegistrationBatchPlan, item: RegistrationPlanItem
+) -> Path:
+    """Return the OME-TIFF that preserves all warped source channels."""
+
+    source_stem = safe_stem(item.moving_path.stem, "moving")
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    suffix = _downsample_suffix(plan.registration_downsample)
+    if plan.batch_root is not None:
+        root = plan.batch_root / "warped_scientific"
+    else:
+        root = plan.fixed_path.parent
+    if plan.is_cascade:
+        name = f"{item.index:03d}_{source_stem}_cascaded_scientific{suffix}.ome.tif"
+    else:
+        name = f"{item.index:03d}_{source_stem}_warped_scientific_to_{fixed_stem}{suffix}.ome.tif"
+    return root / name
+
+
+def default_scientific_merged_volume_path(plan: RegistrationBatchPlan) -> Path:
+    """Return the mixed H&E/IF channel-preserving ZCYX OME-TIFF path."""
+
+    fixed_stem = safe_stem(plan.fixed_path.stem, "fixed")
+    if plan.batch_root is not None:
+        prefix = (
+            "HistRegGUI_cascade_scientific_stack"
+            if plan.is_cascade
+            else "HistRegGUI_registered_scientific_stack"
+        )
+        return plan.batch_root / "merged" / f"{prefix}_{fixed_stem}.ome.tif"
+    manifest_stem = plan.manifest_csv.stem
+    stamp = manifest_stem.removeprefix("HistRegGUI_registration_")
+    return (
+        plan.fixed_path.parent
+        / f"HistRegGUI_registered_scientific_stack_{fixed_stem}_{stamp}.ome.tif"
+    )
+
 def default_merged_volume_path(plan: RegistrationBatchPlan) -> Path:
     """Return a collision-safe OME-TIFF path for an optional merged stack."""
 
@@ -283,7 +345,13 @@ def write_registration_manifest(
         "moving_image",
         "registration_source",
         "registration_target",
+        "registration_guide_source",
+        "registration_guide_target",
         "warped_output",
+        "scientific_warped_output",
+        "source_channel_count",
+        "source_channel_names",
+        "source_dtype",
         "intermediate_directory",
         "loader",
         "device",

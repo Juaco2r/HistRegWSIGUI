@@ -10,8 +10,13 @@ from histreggui.batch import (
     REGISTRATION_MODE_CASCADE,
     REGISTRATION_MODE_SAME_TARGET,
     build_registration_batch_plan,
+    default_fixed_guide_path,
+    default_fixed_scientific_path,
     default_merged_volume_path,
+    default_moving_guide_path,
     default_reference_image_path,
+    default_scientific_merged_volume_path,
+    default_scientific_warped_path,
     registration_target_for_step,
     safe_stem,
     unique_paths,
@@ -156,3 +161,17 @@ def test_cascade_planning_has_no_fixed_slice_count_limit(tmp_path: Path) -> None
     assert len(plan.items) == 1000
     assert plan.items[-1].index == 1000
     assert plan.items[-1].working_source is not None
+
+
+def test_multichannel_paths_are_separate_from_rgb_guides(tmp_path: Path) -> None:
+    fixed = tmp_path / "fixed H&E.ome.tif"
+    moving = tmp_path / "IF four channels.ome.tif"
+    plan = build_registration_batch_plan(
+        fixed, [moving], "stamp", registration_downsample=4
+    )
+    item = plan.items[0]
+    assert "guide" in default_fixed_guide_path(plan).name
+    assert "scientific" in default_fixed_scientific_path(plan).name
+    assert "guide" in default_moving_guide_path(plan, item).name
+    assert default_scientific_warped_path(plan, item).parent.name == "warped_scientific"
+    assert "scientific_stack" in default_scientific_merged_volume_path(plan).name

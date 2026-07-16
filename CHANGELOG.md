@@ -13,6 +13,12 @@
 - Sequential batch execution with GPU-memory cleanup between images and continuation after individual failures.
 - Collision-safe numbered batch outputs plus CSV and JSON registration manifests.
 - Optional merged, Imaris-friendly BigTIFF OME-TIFF volume after registration.
+- IF↔H&E and IF↔IF registration through separate RGB registration guides and channel-preserving scientific payloads.
+- Automatic DAPI/Hoechst guide selection plus selected-channel, maximum, and mean IF guide modes.
+- Optional fluorescence-guide inversion and target-grid physical calibration for cross-modality H&E/IF outputs.
+- Application of each calculated displacement field to every original IF channel while preserving channel names and integer dtype.
+- Mixed H&E/IF scientific OME-TIFF export with `ZCYX` axes, union channel schema, and zero filling for channels absent from a Z slice.
+- Optional simultaneous RGB `ZYXS` quality-control stack and scientific `ZCYX` analysis stack.
 - Streaming 256 × 256 tile writer that avoids loading the complete Z-stack or complete slides into RAM.
 - Fixed-target inclusion, editable Z spacing, automatic/editable XY calibration, and 1×–32× merge downsampling.
 - Moving-image Move up/Move down controls so Z-slice order is explicit before stack creation.
