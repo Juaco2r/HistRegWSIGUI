@@ -93,7 +93,7 @@ def main() -> None:
         raise RuntimeError(f"IF/H&E registration-guide support was not packaged: {payload}")
     if payload.get("scientific_multichannel_zcyx") != "ok":
         raise RuntimeError(f"Scientific multichannel merge support was not packaged: {payload}")
-    if payload.get("version") != "1.0":
+    if payload.get("version") != "2.0":
         raise RuntimeError(f"Unexpected packaged application version: {payload}")
     if int(payload.get("supported_extension_count", 0)) < 10:
         raise RuntimeError(f"Image-format support table is incomplete: {payload}")

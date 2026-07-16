@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0] - 2026-07-16
+
+### Added
+- Multichannel IF-to-H&E registration, channel-preserving scientific warping, cascading serial-section registration, and streamed 3-D OME-TIFF merge output.
+
+### Fixed
+- Prevented large TIFF/OME-TIFF registration guides from falling back to full-image NumPy allocations.
+- Added sparse guide-intensity sampling and single-channel tile reads for large IF images.
+- Added a libvips single-page scientific TIFF fallback with the documented `unlimited` option for trusted local files.
+- Pinned mutually compatible tifffile, Zarr, numcodecs, and imagecodecs versions in packaged applications.
+- Warped multichannel TIFF pages independently instead of opening all pages as one tall libvips image.
+
 ## [1.0] - 2026-07-15
 
 ### Added

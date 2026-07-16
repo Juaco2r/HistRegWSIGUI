@@ -1,4 +1,4 @@
-# HistRegGUI v1.0
+# HistRegGUI v2.0
 
 Desktop GUI for histological image registration with **DeeperHistReg**.
 
@@ -10,7 +10,7 @@ compatible NVIDIA GPU when CUDA is explicitly enabled inside the application.
 
 ## Release downloads
 
-A `v1.0` tag builds and publishes all six packages:
+A `v2.0` tag builds and publishes all six packages:
 
 - `HistRegGUI-Windows-x64-CPU.zip`
 - `HistRegGUI-Windows-x64-CUDA.zip`
@@ -223,15 +223,15 @@ For a test build:
 2. Select **Run workflow**.
 3. Leave `cuda_target` as `both` to generate all six packages.
 
-For the v1.0 release:
+For the v2.0 release:
 
 ```bash
-python scripts/validate_release_metadata.py --tag v1.0
+python scripts/validate_release_metadata.py --tag v2.0
 git add .
-git commit -m "Release HistRegGUI v1.0"
+git commit -m "Release HistRegGUI v2.0"
 git push origin main
-git tag v1.0
-git push origin v1.0
+git tag v2.0
+git push origin v2.0
 ```
 
 The tag run tests, packages, smoke-tests, and publishes all platform archives in
@@ -248,7 +248,7 @@ The repository includes:
 
 Before creating the first release, sign in to Zenodo with GitHub, synchronize
 repositories, and enable `Juaco2r/HistRegWSIGUI`. Once enabled, the GitHub
-Release created from tag `v1.0` is automatically ingested by Zenodo and receives
+Release created from tag `v2.0` is automatically ingested by Zenodo and receives
 a DOI. Repository files cannot perform that one-time account authorization.
 
 ## Local Windows CPU build

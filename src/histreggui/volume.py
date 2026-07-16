@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image
 
+from histreggui import __version__
 from histreggui.image_io import RASTER_EXTENSIONS, TIFF_EXTENSIONS, WSI_EXTENSIONS, has_extension
 
 
@@ -633,7 +634,7 @@ def create_downsampled_registration_tiff(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
 
         with tifffile.TiffFile(str(partial_path)) as tif:
@@ -797,7 +798,7 @@ def create_merged_ome_tiff(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
 
         # Structural validation does not load the volume. It confirms that the

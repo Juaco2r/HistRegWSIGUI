@@ -1,10 +1,11 @@
 cff-version: 1.2.0
 message: "If you use HistRegGUI, please cite this software release."
 title: "HistRegGUI: Multiplatform Histological Image Registration with DeeperHistReg"
-version: "1.0"
+version: "2.0"
 date-released: 2026-07-15
 type: software
 license: MIT
+doi: "10.5281/zenodo.21385959"
 authors:
   - given-names: "José"
     family-names: "Rodriguez-Rojas"

@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image
 
+from histreggui import __version__
 from histreggui.image_io import RASTER_EXTENSIONS, TIFF_EXTENSIONS, has_extension
 
 
@@ -309,6 +310,19 @@ class _ChannelReader:
     def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
         raise NotImplementedError
 
+    def read_channel_tile(
+        self, channel: int, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        """Read one channel only.
+
+        Reader-specific implementations override this method so large planar IF
+        files do not decode every channel for every output tile.
+        """
+        channels = self.read_channels_tile(x, y, width, height)
+        if channel < 0 or channel >= channels.shape[0]:
+            raise IndexError(f"Channel {channel} is outside 0..{channels.shape[0] - 1}.")
+        return np.ascontiguousarray(channels[channel])
+
     def close(self) -> None:
         return None
 
@@ -320,6 +334,15 @@ class _ChannelReader:
 
 
 class _TiffChannelReader(_ChannelReader):
+    """Lazy TIFF/OME-TIFF region reader backed by tifffile + Zarr.
+
+    A complete ``series.asarray()`` fallback is deliberately forbidden for large
+    compressed microscopy files.  That fallback was the source of multi-gigabyte
+    allocations when Zarr could not be opened in packaged applications.
+    """
+
+    _MAX_SMALL_FULL_READ_BYTES = 128 * 1024 * 1024
+
     def __init__(self, path: Path, downsample: int) -> None:
         import tifffile
 
@@ -344,7 +367,9 @@ class _TiffChannelReader(_ChannelReader):
             if width >= output_width and height >= output_height:
                 suitable.append((width * height, level, axes, width, height))
         if suitable:
-            _area, selected, axes, level_width, level_height = min(suitable, key=lambda item: item[0])
+            _area, selected, axes, level_width, level_height = min(
+                suitable, key=lambda item: item[0]
+            )
         else:
             selected, axes = base, base_axes
             level_width, level_height = self.info.width, self.info.height
@@ -352,25 +377,51 @@ class _TiffChannelReader(_ChannelReader):
         self.axes = axes
         self.level_width = int(level_width)
         self.level_height = int(level_height)
-        try:
-            import zarr
-            self.array = zarr.open(selected.aszarr(), mode="r")
-        except Exception:
-            try:
-                self.array = tifffile.memmap(str(path), series=0)
-            except Exception:
-                # Test/minimal environments may not have zarr.  The packaged app
-                # installs zarr and therefore keeps compressed TIFF access lazy;
-                # this final fallback preserves correctness for small files.
-                self.array = base.asarray()
-            self.axes = base_axes
-            self.level_width = self.info.width
-            self.level_height = self.info.height
         self.output_width = output_width
         self.output_height = output_height
+        self._backend = ""
+        errors: list[str] = []
+
+        try:
+            import zarr
+
+            self.array = zarr.open(selected.aszarr(), mode="r")
+            self._backend = "tifffile-zarr"
+        except Exception as exc:
+            errors.append(f"tifffile/Zarr: {type(exc).__name__}: {exc}")
+            try:
+                # Memory mapping is safe only for compatible contiguous/uncompressed
+                # TIFF layouts. It does not create an in-memory copy.
+                self.array = tifffile.memmap(str(path), series=0)
+                self.axes = base_axes
+                self.level_width = self.info.width
+                self.level_height = self.info.height
+                self._backend = "tifffile-memmap"
+            except Exception as memmap_exc:
+                errors.append(
+                    f"tifffile memmap: {type(memmap_exc).__name__}: {memmap_exc}"
+                )
+                estimated = int(np.prod(base.shape, dtype=np.int64)) * int(
+                    np.dtype(base.dtype).itemsize
+                )
+                if estimated <= self._MAX_SMALL_FULL_READ_BYTES:
+                    self.array = base.asarray()
+                    self.axes = base_axes
+                    self.level_width = self.info.width
+                    self.level_height = self.info.height
+                    self._backend = "tifffile-small-full-read"
+                else:
+                    self.close()
+                    raise RuntimeError(
+                        "Large TIFF/OME-TIFF could not be opened with lazy Zarr or "
+                        "memory-mapped access. A full-image fallback was blocked to "
+                        "prevent an out-of-memory crash. "
+                        + "; ".join(errors)
+                    )
+
         self.dtype = np.dtype(getattr(self.array, "dtype", base.dtype))
 
-    def _slice_region(self, sx0: int, sy0: int, sx1: int, sy1: int) -> np.ndarray:
+    def _axis_indices(self) -> tuple[str, int, int, int | None]:
         axes = self.axes if self.axes and len(self.axes) == self.array.ndim else ""
         y_axis = axes.index("Y") if axes and "Y" in axes else self.array.ndim - 2
         x_axis = axes.index("X") if axes and "X" in axes else self.array.ndim - 1
@@ -384,37 +435,13 @@ class _TiffChannelReader(_ChannelReader):
             and self.info.channel_count > 1
             and int(self.array.shape[0]) == int(self.info.channel_count)
         ):
-            # Generic multi-page TIFFs may be reported as QYX/IYX instead of CYX.
+            # Generic multipage TIFFs may use QYX/IYX rather than CYX.
             channel_axis = 0
+        return axes, y_axis, x_axis, channel_axis
 
-        slicer: list[int | slice] = []
-        kept_axes: list[str] = []
-        for index in range(self.array.ndim):
-            axis = axes[index] if axes else ""
-            if index == y_axis:
-                slicer.append(slice(sy0, sy1)); kept_axes.append("Y")
-            elif index == x_axis:
-                slicer.append(slice(sx0, sx1)); kept_axes.append("X")
-            elif index == channel_axis:
-                slicer.append(slice(None)); kept_axes.append("C")
-            else:
-                # A single 2-D registration payload is expected. For T/Z/etc.,
-                # preserve the first plane consistently.
-                slicer.append(0)
-
-        array = np.asarray(self.array[tuple(slicer)])
-        kept = "".join(kept_axes)
-        if "C" in kept:
-            order = [kept.index("C"), kept.index("Y"), kept.index("X")]
-            array = np.transpose(array, order)
-        else:
-            order = [kept.index("Y"), kept.index("X")]
-            array = np.transpose(array, order)[None, ...]
-        if self.info.is_rgb and array.shape[0] > 3:
-            array = array[:3]
-        return np.asarray(array)
-
-    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+    def _source_bounds(
+        self, x: int, y: int, width: int, height: int
+    ) -> tuple[int, int, int, int]:
         sx0 = int(math.floor(x * self.level_width / float(self.output_width)))
         sy0 = int(math.floor(y * self.level_height / float(self.output_height)))
         sx1 = int(math.ceil((x + width) * self.level_width / float(self.output_width)))
@@ -423,6 +450,69 @@ class _TiffChannelReader(_ChannelReader):
         sy0 = min(max(0, sy0), self.level_height - 1)
         sx1 = min(max(sx0 + 1, sx1), self.level_width)
         sy1 = min(max(sy0 + 1, sy1), self.level_height)
+        return sx0, sy0, sx1, sy1
+
+    def _slice_region(
+        self,
+        sx0: int,
+        sy0: int,
+        sx1: int,
+        sy1: int,
+        channel: int | None = None,
+    ) -> np.ndarray:
+        axes, y_axis, x_axis, channel_axis = self._axis_indices()
+        if channel is not None and (channel < 0 or channel >= self.info.channel_count):
+            raise IndexError(
+                f"Channel {channel} is outside 0..{self.info.channel_count - 1}."
+            )
+
+        slicer: list[int | slice] = []
+        kept_axes: list[str] = []
+        for index in range(self.array.ndim):
+            if index == y_axis:
+                slicer.append(slice(sy0, sy1))
+                kept_axes.append("Y")
+            elif index == x_axis:
+                slicer.append(slice(sx0, sx1))
+                kept_axes.append("X")
+            elif index == channel_axis:
+                if channel is None:
+                    slicer.append(slice(None))
+                    kept_axes.append("C")
+                else:
+                    slicer.append(int(channel))
+            else:
+                # A single 2-D registration payload is expected. For T/Z/etc.,
+                # use the first plane consistently.
+                slicer.append(0)
+
+        array = np.asarray(self.array[tuple(slicer)])
+        kept = "".join(kept_axes)
+        if channel is not None:
+            if array.ndim != 2:
+                array = np.squeeze(array)
+            return np.ascontiguousarray(array)
+        if "C" in kept:
+            order = [kept.index("C"), kept.index("Y"), kept.index("X")]
+            array = np.transpose(array, order)
+        else:
+            order = [kept.index("Y"), kept.index("X")]
+            array = np.transpose(array, order)[None, ...]
+        if self.info.is_rgb and array.shape[0] > 3:
+            array = array[:3]
+        return np.ascontiguousarray(array)
+
+    def read_channel_tile(
+        self, channel: int, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        sx0, sy0, sx1, sy1 = self._source_bounds(x, y, width, height)
+        plane = self._slice_region(sx0, sy0, sx1, sy1, channel=channel)
+        if plane.shape != (height, width):
+            plane = _resize_plane(plane, width, height)
+        return np.ascontiguousarray(plane)
+
+    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        sx0, sy0, sx1, sy1 = self._source_bounds(x, y, width, height)
         channels = self._slice_region(sx0, sy0, sx1, sy1)
         if channels.shape[1:] != (height, width):
             channels = np.stack(
@@ -446,17 +536,32 @@ class _PillowChannelReader(_ChannelReader):
         self.output_height = max(1, int(math.ceil(self.info.height / float(downsample))))
         self.dtype = np.dtype(np.uint8)
 
-    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+    def _read_region(self, x: int, y: int, width: int, height: int) -> np.ndarray:
         sx0 = int(math.floor(x * self.info.width / float(self.output_width)))
         sy0 = int(math.floor(y * self.info.height / float(self.output_height)))
         sx1 = int(math.ceil((x + width) * self.info.width / float(self.output_width)))
         sy1 = int(math.ceil((y + height) * self.info.height / float(self.output_height)))
         region = self.image.crop((sx0, sy0, sx1, sy1))
         region = region.resize((width, height), Image.Resampling.LANCZOS)
-        array = np.asarray(region)
+        return np.asarray(region)
+
+    def read_channel_tile(
+        self, channel: int, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        array = self._read_region(x, y, width, height)
+        if array.ndim == 2:
+            if channel != 0:
+                raise IndexError(channel)
+            return np.ascontiguousarray(array)
+        if channel < 0 or channel >= min(3, array.shape[-1]):
+            raise IndexError(channel)
+        return np.ascontiguousarray(array[..., channel])
+
+    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        array = self._read_region(x, y, width, height)
         if array.ndim == 2:
             return array[None, ...]
-        return np.moveaxis(array[..., :3], -1, 0)
+        return np.ascontiguousarray(np.moveaxis(array[..., :3], -1, 0))
 
     def close(self) -> None:
         try:
@@ -464,6 +569,23 @@ class _PillowChannelReader(_ChannelReader):
         except Exception:
             pass
 
+
+def _open_vips_single_image(path: Path, *, page: int = 0) -> Any:
+    """Open one image/page lazily, using TIFF-specific safety options."""
+
+    import pyvips
+
+    if has_extension(path, TIFF_EXTENSIONS):
+        # Force the TIFF loader so the documented unlimited option is accepted
+        # instead of being routed through another foreign loader.
+        return pyvips.Image.tiffload(
+            str(path),
+            access="random",
+            page=int(page),
+            n=1,
+            unlimited=True,
+        )
+    return pyvips.Image.new_from_file(str(path), access="random")
 
 
 class _VipsChannelReader(_ChannelReader):
@@ -474,7 +596,10 @@ class _VipsChannelReader(_ChannelReader):
 
         self.path = Path(path)
         self.info = inspect_image_data(path)
-        self.image = pyvips.Image.new_from_file(str(path), access="random", page=0)
+        # libtiff 4.7+ applies a denial-of-service allocation guard. Trusted
+        # local scientific TIFFs can legitimately exceed that guard even when
+        # only a small output region is requested.
+        self.image = _open_vips_single_image(path, page=0)
         if self.image.bands > 3 and self.info.is_rgb:
             self.image = self.image.extract_band(0, n=3)
         self.output_width = max(1, int(math.ceil(self.info.width / float(downsample))))
@@ -489,7 +614,9 @@ class _VipsChannelReader(_ChannelReader):
             int(image.height), int(image.width), int(image.bands)
         )
 
-    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+    def _read_vips_region(
+        self, image: Any, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
         sx0 = int(math.floor(x * self.info.width / float(self.output_width)))
         sy0 = int(math.floor(y * self.info.height / float(self.output_height)))
         sx1 = int(math.ceil((x + width) * self.info.width / float(self.output_width)))
@@ -498,29 +625,119 @@ class _VipsChannelReader(_ChannelReader):
         sy0 = min(max(0, sy0), self.info.height - 1)
         sx1 = min(max(sx0 + 1, sx1), self.info.width)
         sy1 = min(max(sy0 + 1, sy1), self.info.height)
-        region = self.image.crop(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        region = image.crop(sx0, sy0, sx1 - sx0, sy1 - sy0)
         if int(region.width) != int(width) or int(region.height) != int(height):
             region = region.resize(
                 float(width) / float(region.width),
                 vscale=float(height) / float(region.height),
                 kernel="lanczos3",
             )
-        # Normalise occasional one-pixel rounding differences from libvips.
         if int(region.width) > int(width) or int(region.height) > int(height):
-            region = region.crop(0, 0, min(int(region.width), int(width)), min(int(region.height), int(height)))
-        if int(region.width) != int(width) or int(region.height) != int(height):
-            region = region.gravity(
-                "centre",
-                int(width),
-                int(height),
-                extend="copy",
+            region = region.crop(
+                0, 0, min(int(region.width), int(width)), min(int(region.height), int(height))
             )
-        array = self._to_numpy(region)
+        if int(region.width) != int(width) or int(region.height) != int(height):
+            region = region.gravity("centre", int(width), int(height), extend="copy")
+        return self._to_numpy(region)
+
+    def read_channel_tile(
+        self, channel: int, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        if channel < 0 or channel >= int(self.image.bands):
+            raise IndexError(channel)
+        array = self._read_vips_region(
+            self.image.extract_band(int(channel)), x, y, width, height
+        )
+        if array.ndim == 3:
+            array = array[..., 0]
+        return np.ascontiguousarray(array)
+
+    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        array = self._read_vips_region(self.image, x, y, width, height)
         if array.ndim == 2:
             return np.ascontiguousarray(array[None, ...])
         if array.shape[-1] > 3 and self.info.is_rgb:
             array = array[..., :3]
         return np.ascontiguousarray(np.moveaxis(array, -1, 0))
+
+
+class _VipsTiffPageChannelReader(_ChannelReader):
+    """Fallback reader that opens scientific TIFF pages one at a time.
+
+    This path is used only when tifffile/Zarr cannot expose lazy regions. It
+    avoids ``n=-1`` (the tall multipage "toilet-roll" image) and enables the
+    libtiff unlimited option for trusted user-selected scientific files.
+    """
+
+    def __init__(self, path: Path, downsample: int) -> None:
+        import pyvips
+
+        self.path = Path(path)
+        self.info = inspect_image_data(path)
+        first = _open_vips_single_image(path, page=0)
+        expected = 3 if self.info.is_rgb else self.info.channel_count
+        if int(first.bands) >= expected:
+            self.images = [first.extract_band(index) for index in range(expected)]
+        elif int(first.bands) == 1 and expected > 1:
+            images = [first]
+            for index in range(1, expected):
+                images.append(_open_vips_single_image(path, page=index).extract_band(0))
+            self.images = images
+        else:
+            raise RuntimeError(
+                f"libvips exposed {first.bands} band(s), but {expected} are required."
+            )
+        if not self.images:
+            raise RuntimeError("No TIFF channels were exposed by libvips.")
+        width, height = int(self.images[0].width), int(self.images[0].height)
+        if any(int(image.width) != width or int(image.height) != height for image in self.images):
+            raise RuntimeError("TIFF channel pages do not share the same dimensions.")
+        self.source_width, self.source_height = width, height
+        self.output_width = max(1, int(math.ceil(width / float(downsample))))
+        self.output_height = max(1, int(math.ceil(height / float(downsample))))
+        self.dtype = _vips_numpy_dtype(str(self.images[0].format))
+
+    def _to_numpy(self, image: Any) -> np.ndarray:
+        if hasattr(image, "numpy"):
+            array = np.asarray(image.numpy())
+        else:
+            memory = image.write_to_memory()
+            array = np.frombuffer(memory, dtype=self.dtype).reshape(
+                int(image.height), int(image.width), int(image.bands)
+            )
+        return array[..., 0] if array.ndim == 3 else array
+
+    def read_channel_tile(
+        self, channel: int, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        if channel < 0 or channel >= len(self.images):
+            raise IndexError(channel)
+        sx0 = int(math.floor(x * self.source_width / float(self.output_width)))
+        sy0 = int(math.floor(y * self.source_height / float(self.output_height)))
+        sx1 = int(math.ceil((x + width) * self.source_width / float(self.output_width)))
+        sy1 = int(math.ceil((y + height) * self.source_height / float(self.output_height)))
+        sx0 = min(max(0, sx0), self.source_width - 1)
+        sy0 = min(max(0, sy0), self.source_height - 1)
+        sx1 = min(max(sx0 + 1, sx1), self.source_width)
+        sy1 = min(max(sy0 + 1, sy1), self.source_height)
+        region = self.images[channel].crop(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        if int(region.width) != width or int(region.height) != height:
+            region = region.resize(
+                width / float(region.width),
+                vscale=height / float(region.height),
+                kernel="lanczos3",
+            )
+        if int(region.width) > width or int(region.height) > height:
+            region = region.crop(0, 0, min(int(region.width), width), min(int(region.height), height))
+        if int(region.width) != width or int(region.height) != height:
+            region = region.gravity("centre", width, height, extend="copy")
+        return np.ascontiguousarray(self._to_numpy(region), dtype=self.dtype)
+
+    def read_channels_tile(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        return np.stack(
+            [self.read_channel_tile(index, x, y, width, height) for index in range(len(self.images))],
+            axis=0,
+        )
 
 
 def open_channel_reader(path: str | Path, downsample: int = 1) -> _ChannelReader:
@@ -531,14 +748,20 @@ def open_channel_reader(path: str | Path, downsample: int = 1) -> _ChannelReader
             return _TiffChannelReader(path, downsample)
         except Exception as exc:
             errors.append(f"tifffile: {type(exc).__name__}: {exc}")
+        try:
+            return _VipsTiffPageChannelReader(path, downsample)
+        except Exception as exc:
+            errors.append(f"libvips page reader: {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            f"Could not open large TIFF/OME-TIFF {path.name} with a memory-safe reader. "
+            "The application refused to load the complete image into RAM. "
+            + "; ".join(errors)
+        )
     if has_extension(path, RASTER_EXTENSIONS):
         try:
             return _PillowChannelReader(path, downsample)
         except Exception as exc:
             errors.append(f"Pillow: {type(exc).__name__}: {exc}")
-    # Whole-slide H&E formats (SVS, NDPI, MRXS, SCN, etc.) and mixed image
-    # inputs are read lazily through libvips. Scientific IF channel preservation
-    # still requires a TIFF/OME-TIFF that exposes its C axis/pages.
     try:
         return _VipsChannelReader(path, downsample)
     except Exception as exc:
@@ -547,7 +770,6 @@ def open_channel_reader(path: str | Path, downsample: int = 1) -> _ChannelReader
         f"Could not open {path} for channel-preserving guide/merge processing. "
         + "; ".join(errors)
     )
-
 
 def _channel_index_for_guide(info: ImageDataInfo, settings: GuideSettings) -> int:
     if settings.channel_index is not None:
@@ -566,21 +788,42 @@ def _channel_index_for_guide(info: ImageDataInfo, settings: GuideSettings) -> in
 
 
 def _sample_guide_window(path: Path, downsample: int, settings: GuideSettings) -> tuple[float, float]:
+    """Estimate guide contrast from small distributed windows.
+
+    The previous implementation requested one complete overview. Some strip-based
+    TIFFs must decode very large strips even for that overview. Sampling up to a
+    3x3 grid keeps both Python allocations and decoder pressure bounded.
+    """
+
     info = inspect_image_data(path)
-    sample_ds = max(int(downsample), int(math.ceil(max(info.width, info.height) / 1536.0)))
-    with open_channel_reader(path, sample_ds) as reader:
-        channels = reader.read_channels_tile(0, 0, reader.output_width, reader.output_height)
     mode = normalize_guide_mode(settings.mode)
-    if mode in {GUIDE_MODE_AUTO, GUIDE_MODE_CHANNEL}:
-        values = channels[_channel_index_for_guide(info, settings)]
-    elif mode == GUIDE_MODE_MAX:
-        values = np.max(channels.astype(np.float32), axis=0)
-    else:
-        values = np.mean(channels.astype(np.float32), axis=0)
-    finite = np.isfinite(values)
-    if not np.any(finite):
+    samples: list[np.ndarray] = []
+    with open_channel_reader(path, max(1, int(downsample))) as reader:
+        tile_w = min(256, reader.output_width)
+        tile_h = min(256, reader.output_height)
+        max_x = max(0, reader.output_width - tile_w)
+        max_y = max(0, reader.output_height - tile_h)
+        xs = sorted({0, max_x // 2, max_x})
+        ys = sorted({0, max_y // 2, max_y})
+        selected = _channel_index_for_guide(info, settings)
+        for y in ys:
+            for x in xs:
+                if mode in {GUIDE_MODE_AUTO, GUIDE_MODE_CHANNEL}:
+                    values = reader.read_channel_tile(selected, x, y, tile_w, tile_h)
+                else:
+                    channels = reader.read_channels_tile(x, y, tile_w, tile_h)
+                    if mode == GUIDE_MODE_MAX:
+                        values = np.max(channels.astype(np.float32), axis=0)  # type: ignore[union-attr]
+                    else:
+                        values = np.mean(channels.astype(np.float32), axis=0)  # type: ignore[union-attr]
+                finite = np.asarray(values)[np.isfinite(values)]
+                if finite.size:
+                    # Bound percentile input even for unusual reader output sizes.
+                    stride = max(1, finite.size // 65536)
+                    samples.append(np.asarray(finite[::stride]))
+    if not samples:
         return 0.0, 1.0
-    full_data = values[finite]
+    full_data = np.concatenate(samples)
     data = full_data
     nonzero = full_data[full_data > 0]
     if nonzero.size >= max(100, full_data.size // 1000):
@@ -588,14 +831,10 @@ def _sample_guide_window(path: Path, downsample: int, settings: GuideSettings) -
     low = float(np.percentile(data, 0.5))
     high = float(np.percentile(data, 99.8))
     if high <= low:
-        # Uniform positive fluorescence is common after masks/thresholding.  In
-        # that case excluding zeros would collapse both signal and background
-        # to black, so use the complete sample to retain contrast.
         low, high = float(np.min(full_data)), float(np.max(full_data))
     if high <= low:
         high = low + 1.0
     return low, high
-
 
 def _scale_to_uint8(array: np.ndarray, low: float, high: float, invert: bool = False) -> np.ndarray:
     values = np.asarray(array, dtype=np.float32)
@@ -659,9 +898,13 @@ def create_registration_guide_tiff(
                 th = min(tile_size, height - y)
                 for x in range(0, width, tile_size):
                     tw = min(tile_size, width - x)
-                    channels = reader.read_channels_tile(x, y, tw, th)
+                    channels = (
+                        reader.read_channels_tile(x, y, tw, th)
+                        if info.is_rgb or mode in {GUIDE_MODE_MAX, GUIDE_MODE_MEAN}
+                        else None
+                    )
                     if info.is_rgb:
-                        rgb = np.moveaxis(channels[:3], 0, -1)
+                        rgb = np.moveaxis(channels[:3], 0, -1)  # type: ignore[index]
                         if rgb.dtype == np.uint8:
                             guide = rgb
                         elif np.issubdtype(rgb.dtype, np.integer):
@@ -671,7 +914,9 @@ def create_registration_guide_tiff(
                             guide = _scale_to_uint8(rgb, float(np.nanmin(rgb)), float(np.nanmax(rgb)))
                     else:
                         if mode in {GUIDE_MODE_AUTO, GUIDE_MODE_CHANNEL}:
-                            plane = channels[_channel_index_for_guide(info, settings)]
+                            plane = reader.read_channel_tile(
+                                _channel_index_for_guide(info, settings), x, y, tw, th
+                            )
                         elif mode == GUIDE_MODE_MAX:
                             plane = np.max(channels.astype(np.float32), axis=0)
                         else:
@@ -712,7 +957,7 @@ def create_registration_guide_tiff(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
         with tifffile.TiffFile(str(partial)) as tif:
             if tuple(tif.series[0].shape) != (height, width, 3) or tif.ome_metadata is None:
@@ -779,11 +1024,13 @@ def create_scientific_payload_copy(
                     th = min(tile_size, height - y)
                     for x in range(0, width, tile_size):
                         tw = min(tile_size, width - x)
-                        data = reader.read_channels_tile(x, y, tw, th)
-                        if channel >= data.shape[0]:
+                        try:
+                            tile = np.asarray(
+                                reader.read_channel_tile(channel, x, y, tw, th),
+                                dtype=dtype,
+                            )
+                        except IndexError:
                             tile = np.zeros((th, tw), dtype=dtype)
-                        else:
-                            tile = np.asarray(data[channel], dtype=dtype)
                         completed += 1
                         if progress_callback and (completed == total or completed % max(1, total // 100) == 0):
                             progress_callback(completed, total, f"Writing scientific payload: {completed}/{total} tiles")
@@ -811,7 +1058,7 @@ def create_scientific_payload_copy(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
         with tifffile.TiffFile(str(partial)) as tif:
             if tuple(tif.series[0].shape) != (channel_count, height, width):
@@ -853,36 +1100,25 @@ def _vips_numpy_dtype(format_name: str) -> np.dtype:
     return np.dtype(mapping[format_name])
 
 
-def _load_pyvips_channels(path: Path, expected_channels: int) -> Any:
-    """Load bands/pages lazily as one libvips multiband image."""
+def _load_pyvips_channel_images(path: Path, expected_channels: int) -> list[Any]:
+    """Open each scientific channel as an independent lazy libvips image."""
 
     import pyvips
 
-    image = pyvips.Image.new_from_file(str(path), access="random", n=-1)
-    page_height = 0
-    try:
-        if image.get_typeof("page-height"):
-            page_height = int(image.get("page-height"))
-    except Exception:
-        page_height = 0
+    first = _open_vips_single_image(path, page=0)
+    if int(first.bands) >= expected_channels:
+        return [first.extract_band(index) for index in range(expected_channels)]
 
-    if page_height > 0 and image.height > page_height and expected_channels > image.bands:
-        page_count = image.height // page_height
-        pages = [image.crop(0, index * page_height, image.width, page_height) for index in range(page_count)]
-        if pages and all(page.bands == 1 for page in pages[:expected_channels]):
-            joined = pages[0]
-            for page in pages[1:expected_channels]:
-                joined = joined.bandjoin(page)
-            image = joined
-    if image.bands > expected_channels:
-        image = image.extract_band(0, n=expected_channels)
-    if image.bands < expected_channels:
-        raise RuntimeError(
-            f"libvips exposed {image.bands} bands for {path.name}, but {expected_channels} are required. "
-            "Convert the source to a planar OME-TIFF before multichannel warping."
-        )
-    return image
+    if has_extension(path, TIFF_EXTENSIONS) and int(first.bands) == 1:
+        images = [first]
+        for index in range(1, expected_channels):
+            images.append(_open_vips_single_image(path, page=index).extract_band(0))
+        return images
 
+    raise RuntimeError(
+        f"libvips exposed {first.bands} band(s) for {path.name}, but "
+        f"{expected_channels} are required. Convert the source to planar OME-TIFF."
+    )
 
 def _calculate_center_padding(source_width: int, source_height: int, target_width: int, target_height: int):
     canvas_width, canvas_height = max(source_width, target_width), max(source_height, target_height)
@@ -901,7 +1137,7 @@ def _calculate_center_padding(source_width: int, source_height: int, target_widt
 
 
 def _write_pyvips_as_ome_cyx(
-    image: Any,
+    image: Any | Sequence[Any],
     output_path: Path,
     *,
     channel_names: Sequence[str],
@@ -917,8 +1153,16 @@ def _write_pyvips_as_ome_cyx(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     partial = output_path.with_name(output_path.name + ".partial")
     partial.unlink(missing_ok=True)
-    width, height, channels = int(image.width), int(image.height), int(image.bands)
-    dtype = _vips_numpy_dtype(str(image.format))
+    if isinstance(image, (list, tuple)):
+        bands = list(image)
+    else:
+        bands = [image.extract_band(index) for index in range(int(image.bands))]
+    if not bands:
+        raise RuntimeError("No scientific bands were supplied for OME-TIFF writing.")
+    width, height, channels = int(bands[0].width), int(bands[0].height), len(bands)
+    if any(int(band.width) != width or int(band.height) != height for band in bands):
+        raise RuntimeError("Warped scientific bands do not share the same dimensions.")
+    dtype = _vips_numpy_dtype(str(bands[0].format))
     tile_count = channels * math.ceil(width / tile_size) * math.ceil(height / tile_size)
     completed = 0
 
@@ -930,8 +1174,7 @@ def _write_pyvips_as_ome_cyx(
 
     def tiles() -> Iterable[np.ndarray]:
         nonlocal completed
-        for channel in range(channels):
-            band = image.extract_band(channel)
+        for channel, band in enumerate(bands):
             for y in range(0, height, tile_size):
                 th = min(tile_size, height - y)
                 for x in range(0, width, tile_size):
@@ -966,7 +1209,7 @@ def _write_pyvips_as_ome_cyx(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
         with tifffile.TiffFile(str(partial)) as tif:
             if tuple(tif.series[0].shape) != (channels, height, width):
@@ -1028,49 +1271,50 @@ def warp_scientific_payload(
     expected_channels = 3 if source_info.is_rgb else source_info.channel_count
     names = ("Red", "Green", "Blue") if source_info.is_rgb else source_info.channel_names
 
-    image = _load_pyvips_channels(source_path, expected_channels)
-    scale_x = source_guide.width / float(image.width)
-    scale_y = source_guide.height / float(image.height)
-    if abs(scale_x - 1.0) > 1e-9 or abs(scale_y - 1.0) > 1e-9:
-        image = image.resize(scale_x, vscale=scale_y, kernel="lanczos3")
-    # libvips rounds dimensions after resampling. Normalise rare one-pixel
-    # differences so scientific payload geometry exactly matches the guide.
-    if image.width != source_guide.width or image.height != source_guide.height:
-        if image.width > source_guide.width or image.height > source_guide.height:
-            image = image.crop(
-                0,
-                0,
-                min(int(image.width), int(source_guide.width)),
-                min(int(image.height), int(source_guide.height)),
-            )
-        if image.width != source_guide.width or image.height != source_guide.height:
-            image = image.gravity(
-                "centre",
-                int(source_guide.width),
-                int(source_guide.height),
-                extend="background",
-                background=[0.0] * int(image.bands),
-            )
-
+    source_bands = _load_pyvips_channel_images(source_path, expected_channels)
+    first_band = source_bands[0]
+    scale_x = source_guide.width / float(first_band.width)
+    scale_y = source_guide.height / float(first_band.height)
     padding = _calculate_center_padding(
         source_guide.width, source_guide.height, target_guide.width, target_guide.height
     )
-    background = [0.0] * int(image.bands)
-    padded = image.gravity(
-        "centre",
-        int(padding["canvas_width"]),
-        int(padding["canvas_height"]),
-        extend="background",
-        background=background,
-    )
     displacement = DisplacementFieldLoader().load(str(displacement_field_path))
-    warped = dhr_warping.warp_pyvips_with_tc_df(padded, displacement, pad_value=0.0)
-    warped = warped.crop(
-        int(padding["target_left"]),
-        int(padding["target_top"]),
-        int(target_guide.width),
-        int(target_guide.height),
-    )
+    warped_bands: list[Any] = []
+    for band in source_bands:
+        image = band
+        if abs(scale_x - 1.0) > 1e-9 or abs(scale_y - 1.0) > 1e-9:
+            image = image.resize(scale_x, vscale=scale_y, kernel="lanczos3")
+        if image.width != source_guide.width or image.height != source_guide.height:
+            if image.width > source_guide.width or image.height > source_guide.height:
+                image = image.crop(
+                    0, 0,
+                    min(int(image.width), int(source_guide.width)),
+                    min(int(image.height), int(source_guide.height)),
+                )
+            if image.width != source_guide.width or image.height != source_guide.height:
+                image = image.gravity(
+                    "centre",
+                    int(source_guide.width),
+                    int(source_guide.height),
+                    extend="background",
+                    background=0.0,
+                )
+        padded = image.gravity(
+            "centre",
+            int(padding["canvas_width"]),
+            int(padding["canvas_height"]),
+            extend="background",
+            background=0.0,
+        )
+        warped = dhr_warping.warp_pyvips_with_tc_df(
+            padded, displacement, pad_value=0.0
+        ).crop(
+            int(padding["target_left"]),
+            int(padding["target_top"]),
+            int(target_guide.width),
+            int(target_guide.height),
+        )
+        warped_bands.append(warped)
 
     # The warped scientific payload is sampled on the target guide grid.  Its
     # physical spacing must therefore follow the target/reference image, not
@@ -1088,7 +1332,7 @@ def warp_scientific_payload(
             float(source_pixel_size_um[1]) * (source_info.height / float(source_guide.height)),
         )
     return _write_pyvips_as_ome_cyx(
-        warped,
+        warped_bands,
         output_path,
         channel_names=names,
         pixel_size_um=output_pixel_size,
@@ -1253,7 +1497,7 @@ def create_merged_scientific_ome_tiff(
                 tile=(tile_size, tile_size),
                 compression=compression,
                 metadata=metadata,
-                software="HistRegGUI v1.0",
+                software=f"HistRegGUI v{__version__}",
             )
         with tifffile.TiffFile(str(partial)) as tif:
             expected = (len(normalized), channels, height, width)

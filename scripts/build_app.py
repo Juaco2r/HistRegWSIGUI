@@ -166,6 +166,8 @@ def main() -> None:
         "SimpleITK",
         "tifffile",
         "zarr",
+        "numcodecs",
+        "imagecodecs",
         "skimage",
         "sklearn",
         "cv2",

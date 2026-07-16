@@ -217,6 +217,28 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+
+def _friendly_registration_error(exc: Exception) -> str:
+    """Return actionable text for common large-image backend failures."""
+
+    raw = str(exc).strip() or type(exc).__name__
+    lowered = raw.lower()
+    if "tiff2vips" in lowered and "cumulative memory allocation" in lowered:
+        return (
+            "The TIFF decoder reached its protective allocation limit while reading "
+            "a large TIFF/OME-TIFF. HistRegGUI will use lazy tifffile/Zarr access first "
+            "and a single-page libvips fallback for trusted files. If this still occurs, "
+            "the TIFF may contain unusually large strips or damaged offsets; converting "
+            "it to a tiled OME-BigTIFF is recommended.\n\nTechnical detail: " + raw
+        )
+    if "unable to write to memory" in lowered or "out of memory" in lowered:
+        return (
+            "A backend could not allocate the memory requested for this image. Increase "
+            "the registration downsample, close other large applications, or convert the "
+            "source to a tiled/pyramidal OME-TIFF.\n\nTechnical detail: " + raw
+        )
+    return raw
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1646,7 +1668,7 @@ class App(tk.Tk):
                         registration_target,
                         trace,
                     )
-                    short_error = str(exc).strip() or type(exc).__name__
+                    short_error = _friendly_registration_error(exc).splitlines()[0]
                     if len(short_error) > 90:
                         short_error = short_error[:87] + "..."
                     self._set_moving_status(
@@ -1960,7 +1982,7 @@ class App(tk.Tk):
             self._show_error(
                 "Registration error",
                 "The registration run could not be completed.\n\n"
-                f"Error: {exc!r}\n\n"
+                f"Error: {_friendly_registration_error(exc)}\n\n"
                 f"Full traceback:\n{trace}\n\n"
                 f"Log saved to:\n{log_path}",
             )

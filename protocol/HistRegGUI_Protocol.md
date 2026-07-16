@@ -1,6 +1,6 @@
 # HistRegGUI Protocol
 
-Version: 1.0
+Version: 2.0
 
 Author: Jose Rodriguez-Rojas
 
@@ -134,7 +134,7 @@ Registration results should be reviewed visually before quantitative analysis. C
 
 ## 9. Distribution
 
-GitHub Actions builds the application independently on Windows, Ubuntu, and macOS runners. Version tags matching `v*` publish the generated archives in a GitHub Release. When the public repository is enabled in Zenodo, the GitHub Release for `v1.0` is ingested and receives a DOI.
+GitHub Actions builds the application independently on Windows, Ubuntu, and macOS runners. Version tags matching `v*` publish the generated archives in a GitHub Release. When the public repository is enabled in Zenodo, the GitHub Release for `v2.0` is ingested and receives a DOI.
 
 The application is built with PyInstaller and includes the installed DeeperHistReg package, its resources, and binary image backends needed by the release.
 

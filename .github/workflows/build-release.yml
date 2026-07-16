@@ -144,7 +144,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate v1.0 release metadata
+      - name: Validate v2.0 release metadata
         shell: bash
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
@@ -213,6 +213,8 @@ jobs:
           import pyvips
           import tifffile
           import zarr
+          import numcodecs
+          import imagecodecs
           import torch
           import torchvision
           from histreggui.pillow_compat import install_pillow_tkinter_finder_alias
@@ -231,6 +233,8 @@ jobs:
           print("pyvips:", pyvips.__version__)
           print("tifffile:", tifffile.__version__)
           print("zarr:", zarr.__version__)
+          print("numcodecs:", numcodecs.__version__)
+          print("imagecodecs:", imagecodecs.__version__)
           print("PIL._tkinter_finder and PIL.tkinter_finder alias: OK")
           PY
 

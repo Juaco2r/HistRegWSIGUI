@@ -269,3 +269,58 @@ def test_identity_deformation_is_applied_to_every_if_channel_when_backends_avail
     assert result.channel_names == ("DAPI", "FITC", "TRITC", "Cy5")
     assert result.pixel_size_x_um == 1.5
     assert result.pixel_size_y_um == 1.6
+
+
+
+def test_selected_if_guide_reads_only_one_channel_per_tile(tmp_path: Path, monkeypatch) -> None:
+    """The selected-channel guide must not decode all IF channels for every tile."""
+    import histreggui.multichannel as mc
+
+    source = tmp_path / "if.ome.tif"
+    _write_if(source)
+    calls = {"single": 0, "all": 0}
+    original_open = mc.open_channel_reader
+
+    class Proxy:
+        def __init__(self, reader):
+            self._reader = reader
+            self.info = reader.info
+            self.output_width = reader.output_width
+            self.output_height = reader.output_height
+            self.dtype = reader.dtype
+
+        def read_channel_tile(self, *args, **kwargs):
+            calls["single"] += 1
+            return self._reader.read_channel_tile(*args, **kwargs)
+
+        def read_channels_tile(self, *args, **kwargs):
+            calls["all"] += 1
+            return self._reader.read_channels_tile(*args, **kwargs)
+
+        def __enter__(self):
+            self._reader.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._reader.__exit__(*args)
+
+    monkeypatch.setattr(mc, "open_channel_reader", lambda *a, **k: Proxy(original_open(*a, **k)))
+    mc.create_registration_guide_tiff(
+        source,
+        tmp_path / "guide.ome.tif",
+        settings=mc.GuideSettings(mode="channel", channel_index=1),
+        tile_size=16,
+        compression=None,
+    )
+    assert calls["single"] > 0
+    assert calls["all"] == 0
+
+
+def test_large_tiff_reader_blocks_unsafe_full_array_fallback(tmp_path: Path, monkeypatch) -> None:
+    """Source code must retain the explicit large-full-read guard."""
+    import inspect
+    import histreggui.multichannel as mc
+
+    source = inspect.getsource(mc._TiffChannelReader)
+    assert "_MAX_SMALL_FULL_READ_BYTES" in source
+    assert "full-image fallback was blocked" in source
